@@ -18,12 +18,17 @@ QTunnel is a fast, secure, and easy-to-use HTTP tunneling solution built in Go. 
 
 1. **Download the client:**
 ```bash
-# Linux/macOS
-curl -L https://github.com/yourusername/qtunnel/releases/latest/download/qtunnel-client-linux -o qtunnel
-chmod +x qtunnel
+# Using installation script (recommended)
+curl -fsSL https://raw.githubusercontent.com/errogaht/qtunnel/main/install.sh | bash
+
+# Or download manually
+curl -L https://github.com/errogaht/qtunnel/releases/latest/download/qtunnel-linux-amd64.tar.gz -o qtunnel.tar.gz
+tar -xzf qtunnel.tar.gz
+chmod +x qtunnel-linux-amd64
+sudo mv qtunnel-linux-amd64 /usr/local/bin/qtunnel
 
 # Or build from source
-git clone https://github.com/yourusername/qtunnel.git
+git clone https://github.com/errogaht/qtunnel.git
 cd qtunnel
 go build -o qtunnel ./client
 ```
@@ -143,7 +148,7 @@ docker-compose up -d
 
 1. **Build the server:**
 ```bash
-git clone https://github.com/yourusername/qtunnel.git
+git clone https://github.com/errogaht/qtunnel.git
 cd qtunnel
 go build -o qtunnel-server ./server
 ```
@@ -274,7 +279,7 @@ For easy installation on client machines:
 
 ```bash
 # Linux/macOS installation script
-curl -fsSL https://raw.githubusercontent.com/yourusername/qtunnel/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/errogaht/qtunnel/main/install.sh | bash
 ```
 
 ## Examples
@@ -384,9 +389,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Support
 
-- 📝 [GitHub Issues](https://github.com/yourusername/qtunnel/issues)
-- 💬 [Discussions](https://github.com/yourusername/qtunnel/discussions)
-- 📖 [Wiki](https://github.com/yourusername/qtunnel/wiki)
+- 📝 [GitHub Issues](https://github.com/errogaht/qtunnel/issues)
+- 💬 [Discussions](https://github.com/errogaht/qtunnel/discussions)
+- 📖 [Wiki](https://github.com/errogaht/qtunnel/wiki)
 
 ## Acknowledgments
 

@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # Configuration
-REPO="yourusername/qtunnel"
+REPO="errogaht/qtunnel"
 INSTALL_DIR="/usr/local/bin"
 BINARY_NAME="qtunnel"
 
@@ -91,32 +91,60 @@ get_latest_release() {
 download_binary() {
     echo -e "${YELLOW}Downloading QTunnel client...${NC}"
     
-    DOWNLOAD_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/qtunnel-client-$OS-$ARCH"
-    
+    # Download the tar.gz/zip file and extract the client binary
     if [ "$OS" = "windows" ]; then
-        DOWNLOAD_URL="${DOWNLOAD_URL}.exe"
+        ARCHIVE_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/qtunnel-$OS-$ARCH.zip"
+        ARCHIVE_FILE="qtunnel-$OS-$ARCH.zip"
         BINARY_NAME="qtunnel.exe"
+        CLIENT_BINARY="qtunnel-$OS-$ARCH.exe"
+    else
+        ARCHIVE_URL="https://github.com/$REPO/releases/download/$LATEST_RELEASE/qtunnel-$OS-$ARCH.tar.gz"
+        ARCHIVE_FILE="qtunnel-$OS-$ARCH.tar.gz"
+        CLIENT_BINARY="qtunnel-$OS-$ARCH"
     fi
     
-    # Create temporary file
-    TEMP_FILE=$(mktemp)
+    # Create temporary directory
+    TEMP_DIR=$(mktemp -d)
+    TEMP_FILE="$TEMP_DIR/$ARCHIVE_FILE"
     
-    # Download with progress bar
-    if ! curl -L --progress-bar "$DOWNLOAD_URL" -o "$TEMP_FILE"; then
-        echo -e "${RED}Error: Failed to download QTunnel client${NC}"
-        echo -e "${RED}URL: $DOWNLOAD_URL${NC}"
-        rm -f "$TEMP_FILE"
+    # Download archive with progress bar
+    if ! curl -L --progress-bar "$ARCHIVE_URL" -o "$TEMP_FILE"; then
+        echo -e "${RED}Error: Failed to download QTunnel archive${NC}"
+        echo -e "${RED}URL: $ARCHIVE_URL${NC}"
+        rm -rf "$TEMP_DIR"
         exit 1
     fi
     
     # Verify download
     if [ ! -s "$TEMP_FILE" ]; then
         echo -e "${RED}Error: Downloaded file is empty${NC}"
-        rm -f "$TEMP_FILE"
+        rm -rf "$TEMP_DIR"
         exit 1
     fi
     
-    echo -e "${GREEN}Download completed successfully${NC}"
+    # Extract archive
+    echo -e "${YELLOW}Extracting archive...${NC}"
+    cd "$TEMP_DIR"
+    if [ "$OS" = "windows" ]; then
+        if command -v unzip >/dev/null 2>&1; then
+            unzip -q "$ARCHIVE_FILE"
+        else
+            echo -e "${RED}Error: unzip is required for Windows archives${NC}"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+    else
+        tar -xzf "$ARCHIVE_FILE"
+    fi
+    
+    # Verify extracted client binary exists
+    if [ ! -f "$CLIENT_BINARY" ]; then
+        echo -e "${RED}Error: Client binary not found in archive${NC}"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+    
+    echo -e "${GREEN}Download and extraction completed successfully${NC}"
 }
 
 install_binary() {
@@ -124,14 +152,17 @@ install_binary() {
     
     INSTALL_PATH="$INSTALL_DIR/$BINARY_NAME"
     
-    # Install binary
+    # Install binary from extracted archive
     if [ "$NEED_SUDO" = "1" ]; then
-        sudo mv "$TEMP_FILE" "$INSTALL_PATH"
+        sudo cp "$TEMP_DIR/$CLIENT_BINARY" "$INSTALL_PATH"
         sudo chmod +x "$INSTALL_PATH"
     else
-        mv "$TEMP_FILE" "$INSTALL_PATH"
+        cp "$TEMP_DIR/$CLIENT_BINARY" "$INSTALL_PATH"
         chmod +x "$INSTALL_PATH"
     fi
+    
+    # Cleanup
+    rm -rf "$TEMP_DIR"
     
     echo -e "${GREEN}QTunnel client installed to: $INSTALL_PATH${NC}"
 }
