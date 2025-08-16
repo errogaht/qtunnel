@@ -115,23 +115,31 @@ func getEnv(key, defaultValue string) string {
 }
 
 func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	clientIP := getClientIP(r)
+	log.Printf("[WS] New WebSocket connection attempt from %s", clientIP)
+	
 	// Проверка токена
 	authToken := r.Header.Get("Authorization")
 	if authToken != "Bearer "+tm.config.AuthToken {
+		log.Printf("[WS] Authentication failed for client %s: invalid token", clientIP)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
+	
+	log.Printf("[WS] Client %s authenticated successfully", clientIP)
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("WebSocket upgrade error: %v", err)
+		log.Printf("[WS] WebSocket upgrade error for client %s: %v", clientIP, err)
 		return
 	}
 	defer conn.Close()
 
+	log.Printf("[WS] WebSocket connection established with client %s", clientIP)
+
 	// Генерируем новый туннель
 	tunnel := tm.createTunnel(conn)
-	log.Printf("New tunnel created: %s -> %s", tunnel.ID, tunnel.Domain)
+	log.Printf("[TUNNEL] New tunnel created: %s -> %s (client: %s)", tunnel.ID, tunnel.Domain, clientIP)
 
 	// Отправляем домен клиенту
 	err = conn.WriteJSON(Message{
@@ -140,9 +148,11 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 		Data:     tunnel.Domain,
 	})
 	if err != nil {
-		log.Printf("Error sending tunnel info: %v", err)
+		log.Printf("[TUNNEL] Error sending tunnel info to %s: %v", tunnel.ID, err)
 		return
 	}
+
+	log.Printf("[TUNNEL] Tunnel info sent to client %s: %s", tunnel.ID, tunnel.Domain)
 
 	// Создаем Traefik конфиг
 	tm.createTraefikConfig(tunnel)
@@ -152,25 +162,37 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 		var msg Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
-			log.Printf("Error reading message: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				log.Printf("[TUNNEL] Unexpected WebSocket close for tunnel %s: %v", tunnel.ID, err)
+			} else {
+				log.Printf("[TUNNEL] Client %s disconnected: %v", tunnel.ID, err)
+			}
 			break
 		}
 
 		tunnel.LastSeen = time.Now()
+		log.Printf("[MSG] Received message from tunnel %s: type=%s", tunnel.ID, msg.Type)
 		
 		// Обработка разных типов сообщений
 		switch msg.Type {
 		case "ping":
-			conn.WriteJSON(Message{Type: "pong"})
+			log.Printf("[PING] Ping received from tunnel %s, sending pong", tunnel.ID)
+			err := conn.WriteJSON(Message{Type: "pong"})
+			if err != nil {
+				log.Printf("[PING] Error sending pong to tunnel %s: %v", tunnel.ID, err)
+			}
 		case "http_response":
+			log.Printf("[HTTP] HTTP response received for tunnel %s, request %s", tunnel.ID, msg.RequestID)
 			tm.handleHTTPResponse(msg)
+		default:
+			log.Printf("[MSG] Unknown message type '%s' from tunnel %s", msg.Type, tunnel.ID)
 		}
 	}
 
 	// Cleanup при отключении
 	tm.removeTunnel(tunnel.ID)
 	tm.removeTraefikConfig(tunnel)
-	log.Printf("Tunnel removed: %s", tunnel.ID)
+	log.Printf("[TUNNEL] Tunnel removed: %s", tunnel.ID)
 }
 
 func (tm *TunnelManager) createTunnel(conn *websocket.Conn) *Tunnel {
@@ -212,19 +234,26 @@ func generateRandomID() string {
 
 func startProxyServer(manager *TunnelManager) {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		clientIP := getClientIP(r)
+		log.Printf("[PROXY] Incoming request from %s: %s %s %s", clientIP, r.Method, r.Host, r.URL.Path)
+		
 		// Извлекаем tunnel ID из домена
 		host := r.Host
 		if strings.HasSuffix(host, "-tun."+manager.config.Domain) {
 			tunnelID := strings.TrimSuffix(host, "-tun."+manager.config.Domain)
+			log.Printf("[PROXY] Request for tunnel %s", tunnelID)
 			
 			tunnel := manager.getTunnel(tunnelID)
 			if tunnel != nil {
+				log.Printf("[PROXY] Tunnel %s found, proxying request", tunnelID)
 				// Проксируем через WebSocket к клиенту
 				manager.proxyRequest(tunnel, r, w)
 			} else {
+				log.Printf("[PROXY] Tunnel %s not found", tunnelID)
 				http.Error(w, "Tunnel not found", http.StatusNotFound)
 			}
 		} else {
+			log.Printf("[PROXY] Invalid domain: %s (expected suffix: -tun.%s)", host, manager.config.Domain)
 			http.Error(w, "Invalid domain", http.StatusBadRequest)
 		}
 	})
@@ -239,6 +268,7 @@ func startProxyServer(manager *TunnelManager) {
 func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.ResponseWriter) {
 	// Генерируем уникальный ID запроса
 	requestID := generateRandomID()
+	log.Printf("[HTTP] Processing request %s for tunnel %s: %s %s", requestID, tunnel.ID, req.Method, req.URL.Path)
 	
 	// Создаем канал для ответа
 	responseChan := make(chan *http.Response, 1)
@@ -246,11 +276,23 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 	tm.pendingRequests[requestID] = responseChan
 	tm.mutex.Unlock()
 	
+	log.Printf("[HTTP] Request %s added to pending requests queue", requestID)
+	
 	// Сериализуем HTTP запрос
-	reqData, _ := httpRequestToJSON(req)
+	reqData, err := httpRequestToJSON(req)
+	if err != nil {
+		log.Printf("[HTTP] Error serializing request %s: %v", requestID, err)
+		http.Error(w, "Request serialization error", http.StatusInternalServerError)
+		tm.mutex.Lock()
+		delete(tm.pendingRequests, requestID)
+		tm.mutex.Unlock()
+		return
+	}
+	
+	log.Printf("[HTTP] Request %s serialized, sending to tunnel %s", requestID, tunnel.ID)
 	
 	// Отправляем клиенту
-	err := tunnel.Client.WriteJSON(Message{
+	err = tunnel.Client.WriteJSON(Message{
 		Type:      "http_request",
 		TunnelID:  tunnel.ID,
 		RequestID: requestID,
@@ -258,7 +300,7 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 	})
 	
 	if err != nil {
-		log.Printf("Error forwarding request: %v", err)
+		log.Printf("[HTTP] Error forwarding request %s to tunnel %s: %v", requestID, tunnel.ID, err)
 		http.Error(w, "Tunnel error", http.StatusBadGateway)
 		tm.mutex.Lock()
 		delete(tm.pendingRequests, requestID)
@@ -266,9 +308,13 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 		return
 	}
 	
+	log.Printf("[HTTP] Request %s sent to tunnel %s, waiting for response", requestID, tunnel.ID)
+	
 	// Ждем ответ от клиента (с таймаутом)
 	select {
 	case response := <-responseChan:
+		log.Printf("[HTTP] Response received for request %s from tunnel %s: status=%d", requestID, tunnel.ID, response.StatusCode)
+		
 		// Копируем заголовки ответа
 		for key, values := range response.Header {
 			for _, value := range values {
@@ -281,12 +327,18 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 		
 		// Копируем тело ответа
 		if response.Body != nil {
-			io.Copy(w, response.Body)
+			bodyBytes, err := io.ReadAll(response.Body)
+			if err != nil {
+				log.Printf("[HTTP] Error reading response body for request %s: %v", requestID, err)
+			} else {
+				log.Printf("[HTTP] Sending response for request %s: %d bytes", requestID, len(bodyBytes))
+				w.Write(bodyBytes)
+			}
 			response.Body.Close()
 		}
 		
 	case <-time.After(30 * time.Second):
-		log.Printf("Request timeout for tunnel %s", tunnel.ID)
+		log.Printf("[HTTP] Request timeout for tunnel %s, request %s (30s)", tunnel.ID, requestID)
 		http.Error(w, "Request timeout", http.StatusGatewayTimeout)
 	}
 	
@@ -294,6 +346,7 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 	tm.mutex.Lock()
 	delete(tm.pendingRequests, requestID)
 	tm.mutex.Unlock()
+	log.Printf("[HTTP] Request %s cleanup completed", requestID)
 }
 
 func httpRequestToJSON(req *http.Request) (string, error) {
@@ -314,36 +367,50 @@ func httpRequestToJSON(req *http.Request) (string, error) {
 }
 
 func (tm *TunnelManager) handleHTTPResponse(msg Message) {
+	log.Printf("[HTTP] Processing HTTP response for request %s from tunnel %s", msg.RequestID, msg.TunnelID)
+	
 	tm.mutex.Lock()
 	responseChan, exists := tm.pendingRequests[msg.RequestID]
 	tm.mutex.Unlock()
 	
 	if !exists {
-		log.Printf("No pending request for ID: %s", msg.RequestID)
+		log.Printf("[HTTP] No pending request for ID: %s (already timed out or completed)", msg.RequestID)
 		return
 	}
+	
+	log.Printf("[HTTP] Found pending request %s, processing response", msg.RequestID)
 	
 	// Парсим ответ от клиента
 	var responseData map[string]interface{}
 	err := json.Unmarshal([]byte(msg.Data), &responseData)
 	if err != nil {
-		log.Printf("Error parsing response: %v", err)
+		log.Printf("[HTTP] Error parsing response for request %s: %v", msg.RequestID, err)
 		return
 	}
 	
+	status, hasStatus := responseData["status"].(float64)
+	if !hasStatus {
+		log.Printf("[HTTP] Invalid response format for request %s: missing status", msg.RequestID)
+		return
+	}
+	
+	log.Printf("[HTTP] Parsed response for request %s: status=%d", msg.RequestID, int(status))
+	
 	// Создаем HTTP ответ
 	response := &http.Response{
-		StatusCode: int(responseData["status"].(float64)),
+		StatusCode: int(status),
 		Header:     make(http.Header),
 	}
 	
 	// Копируем заголовки
+	headerCount := 0
 	if headers, ok := responseData["headers"].(map[string]interface{}); ok {
 		for key, value := range headers {
 			if valueSlice, ok := value.([]interface{}); ok {
 				for _, v := range valueSlice {
 					if vStr, ok := v.(string); ok {
 						response.Header.Add(key, vStr)
+						headerCount++
 					}
 				}
 			}
@@ -351,15 +418,20 @@ func (tm *TunnelManager) handleHTTPResponse(msg Message) {
 	}
 	
 	// Устанавливаем тело ответа
+	bodySize := 0
 	if body, ok := responseData["body"].(string); ok {
+		bodySize = len(body)
 		response.Body = io.NopCloser(strings.NewReader(body))
 	}
+	
+	log.Printf("[HTTP] Response created for request %s: %d headers, %d bytes body", msg.RequestID, headerCount, bodySize)
 	
 	// Отправляем ответ в канал
 	select {
 	case responseChan <- response:
+		log.Printf("[HTTP] Response sent to channel for request %s", msg.RequestID)
 	default:
-		log.Printf("Failed to send response to channel for request %s", msg.RequestID)
+		log.Printf("[HTTP] Failed to send response to channel for request %s (channel full or closed)", msg.RequestID)
 	}
 }
 
@@ -404,17 +476,51 @@ func (tm *TunnelManager) removeTraefikConfig(tunnel *Tunnel) {
 func (tm *TunnelManager) cleanup() {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
+	
+	log.Printf("[CLEANUP] Starting tunnel cleanup routine")
 
 	for range ticker.C {
 		tm.mutex.Lock()
+		tunnelCount := len(tm.tunnels)
+		cleanedCount := 0
+		
 		for id, tunnel := range tm.tunnels {
 			if time.Since(tunnel.LastSeen) > 2*time.Minute {
+				log.Printf("[CLEANUP] Tunnel %s is stale (last seen: %v ago), cleaning up", id, time.Since(tunnel.LastSeen))
 				tunnel.Client.Close()
 				delete(tm.tunnels, id)
 				tm.removeTraefikConfig(tunnel)
-				log.Printf("Cleaned up stale tunnel: %s", id)
+				cleanedCount++
 			}
 		}
 		tm.mutex.Unlock()
+		
+		if cleanedCount > 0 {
+			log.Printf("[CLEANUP] Cleaned up %d stale tunnels (total tunnels: %d -> %d)", cleanedCount, tunnelCount, tunnelCount-cleanedCount)
+		} else {
+			log.Printf("[CLEANUP] No stale tunnels found (total tunnels: %d)", tunnelCount)
+		}
 	}
+}
+
+func getClientIP(r *http.Request) string {
+	// Check X-Forwarded-For header first (for proxies)
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		// Take the first IP if there are multiple
+		if idx := strings.Index(xff, ","); idx != -1 {
+			return strings.TrimSpace(xff[:idx])
+		}
+		return xff
+	}
+	
+	// Check X-Real-IP header
+	if xri := r.Header.Get("X-Real-IP"); xri != "" {
+		return xri
+	}
+	
+	// Fall back to RemoteAddr
+	if idx := strings.LastIndex(r.RemoteAddr, ":"); idx != -1 {
+		return r.RemoteAddr[:idx]
+	}
+	return r.RemoteAddr
 }

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -23,9 +24,10 @@ var (
 )
 
 type Config struct {
-	ServerURL string
-	AuthToken string
-	LocalPort int
+	ServerURL    string
+	AuthToken    string
+	LocalPort    int
+	OutputFormat string
 }
 
 type Message struct {
@@ -43,12 +45,35 @@ type HTTPRequest struct {
 	Body    string              `json:"body"`
 }
 
+type LogEntry struct {
+	Timestamp string      `json:"timestamp"`
+	Level     string      `json:"level"`
+	Message   string      `json:"message"`
+	Details   interface{} `json:"details,omitempty"`
+}
+
+type TunnelStatus struct {
+	TunnelID  string `json:"tunnel_id"`
+	Domain    string `json:"domain"`
+	LocalPort int    `json:"local_port"`
+	Status    string `json:"status"`
+}
+
+type RequestLog struct {
+	RequestID string `json:"request_id"`
+	Method    string `json:"method"`
+	URL       string `json:"url"`
+	Status    int    `json:"status,omitempty"`
+	Duration  string `json:"duration,omitempty"`
+}
+
 func main() {
 	var (
-		serverURL = flag.String("server", "", "QTunnel server WebSocket URL (e.g., wss://qtunnel.example.com/ws)")
-		authToken = flag.String("token", "", "Authentication token for the server")
-		showVersion = flag.Bool("version", false, "Show version information")
-		showHelp = flag.Bool("help", false, "Show help information")
+		serverURL    = flag.String("server", "", "QTunnel server WebSocket URL (e.g., wss://qtunnel.example.com/ws)")
+		authToken    = flag.String("token", "", "Authentication token for the server")
+		outputFormat = flag.String("output-format", "text", "Output format: text or stream.json")
+		showVersion  = flag.Bool("version", false, "Show version information")
+		showHelp     = flag.Bool("help", false, "Show help information")
 	)
 	
 	flag.BoolVar(showVersion, "v", false, "Show version information (shorthand)")
@@ -68,10 +93,11 @@ func main() {
 		fmt.Println("Example: qtunnel --server wss://qtunnel.example.com/ws --token your-token 8003")
 		fmt.Println("")
 		fmt.Println("Options:")
-		fmt.Println("  --server string    QTunnel server WebSocket URL")
-		fmt.Println("  --token string     Authentication token for the server")
-		fmt.Println("  -h, --help        Show this help message")
-		fmt.Println("  -v, --version     Show version information")
+		fmt.Println("  --server string         QTunnel server WebSocket URL")
+		fmt.Println("  --token string          Authentication token for the server")
+		fmt.Println("  --output-format string  Output format: text or stream.json (default: text)")
+		fmt.Println("  -h, --help             Show this help message")
+		fmt.Println("  -v, --version          Show version information")
 		fmt.Println("")
 		fmt.Println("Environment Variables (used as defaults):")
 		fmt.Println("  QTUNNEL_SERVER     WebSocket server URL")
@@ -108,6 +134,12 @@ func main() {
 		finalAuthToken = getEnv("QTUNNEL_AUTH_TOKEN", "default-secret-token")
 	}
 
+	// Validate output format
+	if *outputFormat != "text" && *outputFormat != "stream.json" {
+		fmt.Println("Error: Invalid output format. Use 'text' or 'stream.json'")
+		os.Exit(1)
+	}
+
 	// Validate required parameters
 	if finalServerURL == "wss://localhost:8080/ws" && finalAuthToken == "default-secret-token" {
 		fmt.Println("Error: You must specify server URL and auth token")
@@ -123,42 +155,169 @@ func main() {
 	}
 
 	config := &Config{
-		ServerURL: finalServerURL,
-		AuthToken: finalAuthToken,
-		LocalPort: localPort,
+		ServerURL:    finalServerURL,
+		AuthToken:    finalAuthToken,
+		LocalPort:    localPort,
+		OutputFormat: *outputFormat,
 	}
 
 	client := &TunnelClient{
-		config: config,
+		config:       config,
+		requestTimes: make(map[string]time.Time),
 	}
 
-	log.Printf("Connecting to %s...", config.ServerURL)
-	log.Printf("Local port: %d", localPort)
+	client.logInfo("Starting QTunnel client", map[string]interface{}{
+		"server_url":  config.ServerURL,
+		"local_port":  localPort,
+		"output_format": config.OutputFormat,
+	})
 
 	err = client.Connect()
 	if err != nil {
-		log.Fatalf("Connection failed: %v", err)
+		client.logError("Connection failed", err, nil)
+		os.Exit(1)
 	}
 }
 
 type TunnelClient struct {
-	config   *Config
-	conn     *websocket.Conn
-	tunnelID string
-	domain   string
+	config        *Config
+	conn          *websocket.Conn
+	tunnelID      string
+	domain        string
+	requestTimes  map[string]time.Time
+	requestMutex  sync.RWMutex
+}
+
+func (tc *TunnelClient) logInfo(message string, details interface{}) {
+	tc.outputLog("INFO", message, details)
+}
+
+func (tc *TunnelClient) logWarn(message string, details interface{}) {
+	tc.outputLog("WARN", message, details)
+}
+
+func (tc *TunnelClient) logError(message string, err error, details interface{}) {
+	errorDetails := details
+	if err != nil {
+		if errorDetails == nil {
+			errorDetails = map[string]interface{}{"error": err.Error()}
+		} else if detailsMap, ok := errorDetails.(map[string]interface{}); ok {
+			detailsMap["error"] = err.Error()
+		}
+	}
+	tc.outputLog("ERROR", message, errorDetails)
+}
+
+func (tc *TunnelClient) outputLog(level, message string, details interface{}) {
+	if tc.config.OutputFormat == "stream.json" {
+		logEntry := LogEntry{
+			Timestamp: time.Now().UTC().Format(time.RFC3339),
+			Level:     level,
+			Message:   message,
+			Details:   details,
+		}
+		
+		jsonData, err := json.Marshal(logEntry)
+		if err != nil {
+			// Fallback to standard logging if JSON marshal fails
+			log.Printf("[%s] %s: %v (JSON marshal error: %v)", level, message, details, err)
+			return
+		}
+		
+		fmt.Println(string(jsonData))
+	} else {
+		// Traditional text output
+		if details != nil {
+			log.Printf("[%s] %s: %v", level, message, details)
+		} else {
+			log.Printf("[%s] %s", level, message)
+		}
+	}
+}
+
+func (tc *TunnelClient) outputTunnelStatus(status string) {
+	if tc.config.OutputFormat == "stream.json" {
+		tunnelStatus := TunnelStatus{
+			TunnelID:  tc.tunnelID,
+			Domain:    tc.domain,
+			LocalPort: tc.config.LocalPort,
+			Status:    status,
+		}
+		
+		jsonData, err := json.Marshal(tunnelStatus)
+		if err != nil {
+			tc.logError("Failed to marshal tunnel status", err, nil)
+			return
+		}
+		
+		fmt.Println(string(jsonData))
+	}
 }
 
 func (tc *TunnelClient) Connect() error {
+	maxRetries := 5
+	retryDelay := 5 * time.Second
+
+	tc.logInfo("Starting connection process", map[string]interface{}{
+		"max_retries": maxRetries,
+		"initial_delay": retryDelay.String(),
+	})
+
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			tc.logInfo("Retrying connection", map[string]interface{}{
+				"attempt": retry + 1,
+				"max_attempts": maxRetries,
+				"delay": retryDelay.String(),
+			})
+			time.Sleep(retryDelay)
+			retryDelay *= 2 // Exponential backoff
+		}
+
+		err := tc.connectOnce()
+		if err != nil {
+			tc.logError("Connection attempt failed", err, map[string]interface{}{
+				"attempt": retry + 1,
+				"max_attempts": maxRetries,
+			})
+			continue
+		}
+
+		// If we get here, connection was successful but lost - retry
+		tc.logWarn("Connection lost, retrying", map[string]interface{}{
+			"attempt": retry + 1,
+		})
+	}
+
+	tc.logError("Failed to establish stable connection", nil, map[string]interface{}{
+		"max_attempts": maxRetries,
+	})
+	return fmt.Errorf("failed to establish stable connection after %d attempts", maxRetries)
+}
+
+func (tc *TunnelClient) connectOnce() error {
+	tc.logInfo("Parsing server URL", map[string]interface{}{
+		"url": tc.config.ServerURL,
+	})
+	
 	// Парсим URL сервера
 	u, err := url.Parse(tc.config.ServerURL)
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %v", err)
 	}
 
+	tc.logInfo("Preparing WebSocket connection", map[string]interface{}{
+		"scheme": u.Scheme,
+		"host": u.Host,
+		"path": u.Path,
+	})
+
 	// Добавляем заголовок авторизации
 	headers := http.Header{}
 	headers.Add("Authorization", "Bearer "+tc.config.AuthToken)
 
+	tc.logInfo("Attempting WebSocket connection", nil)
+	
 	// Подключаемся к серверу
 	tc.conn, _, err = websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
@@ -166,20 +325,46 @@ func (tc *TunnelClient) Connect() error {
 	}
 	defer tc.conn.Close()
 
-	log.Println("Connected to server!")
+	tc.logInfo("WebSocket connection established", nil)
+	tc.outputTunnelStatus("connected")
 
+	// Start ping loop in goroutine
+	pingDone := make(chan struct{})
+	go tc.startPingLoop(pingDone)
+	defer close(pingDone)
+
+	tc.logInfo("Starting message processing loop", nil)
+	
 	// Обрабатываем сообщения от сервера
 	for {
+		// Set read deadline to detect dead connections
+		tc.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		
 		var msg Message
 		err := tc.conn.ReadJSON(&msg)
 		if err != nil {
-			log.Printf("Error reading message: %v", err)
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				tc.logError("Unexpected WebSocket close", err, nil)
+			} else {
+				tc.logError("Error reading message from server", err, nil)
+			}
+			tc.outputTunnelStatus("disconnected")
 			break
 		}
 
+		tc.logInfo("Received message from server", map[string]interface{}{
+			"type": msg.Type,
+			"tunnel_id": msg.TunnelID,
+			"request_id": msg.RequestID,
+		})
+
 		err = tc.handleMessage(msg)
 		if err != nil {
-			log.Printf("Error handling message: %v", err)
+			tc.logError("Error handling message", err, map[string]interface{}{
+				"message_type": msg.Type,
+				"tunnel_id": msg.TunnelID,
+				"request_id": msg.RequestID,
+			})
 		}
 	}
 
@@ -191,36 +376,88 @@ func (tc *TunnelClient) handleMessage(msg Message) error {
 	case "tunnel_created":
 		tc.tunnelID = msg.TunnelID
 		tc.domain = msg.Data
-		fmt.Printf("\n🎉 Tunnel created!\n")
-		fmt.Printf("📡 Local port: %d\n", tc.config.LocalPort)
-		fmt.Printf("🌐 Public URL: https://%s\n", tc.domain)
-		fmt.Printf("⏱️  Tunnel active... (Ctrl+C to stop)\n\n")
+		
+		tc.logInfo("Tunnel created successfully", map[string]interface{}{
+			"tunnel_id": tc.tunnelID,
+			"domain": tc.domain,
+			"local_port": tc.config.LocalPort,
+		})
+		
+		tc.outputTunnelStatus("active")
+		
+		if tc.config.OutputFormat == "text" {
+			fmt.Printf("\n🎉 Tunnel created!\n")
+			fmt.Printf("📡 Local port: %d\n", tc.config.LocalPort)
+			fmt.Printf("🌐 Public URL: https://%s\n", tc.domain)
+			fmt.Printf("⏱️  Tunnel active... (Ctrl+C to stop)\n\n")
+		}
 
 	case "http_request":
 		return tc.handleHTTPRequest(msg.RequestID, msg.Data)
 
 	case "pong":
-		// Игнорируем pong сообщения
+		tc.logInfo("Pong received from server", nil)
 
 	default:
-		log.Printf("Unknown message type: %s", msg.Type)
+		tc.logWarn("Unknown message type received", map[string]interface{}{
+			"message_type": msg.Type,
+		})
 	}
 
 	return nil
 }
 
 func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
+	startTime := time.Now()
+	
+	// Store request start time for duration tracking
+	tc.requestMutex.Lock()
+	tc.requestTimes[requestID] = startTime
+	tc.requestMutex.Unlock()
+	
+	tc.logInfo("Processing HTTP request", map[string]interface{}{
+		"request_id": requestID,
+	})
+	
 	// Парсим HTTP запрос
 	var httpReq HTTPRequest
 	err := json.Unmarshal([]byte(data), &httpReq)
 	if err != nil {
+		tc.logError("Failed to parse HTTP request", err, map[string]interface{}{
+			"request_id": requestID,
+		})
 		return fmt.Errorf("failed to parse HTTP request: %v", err)
 	}
 
-	log.Printf("%s %s", httpReq.Method, httpReq.URL)
+	tc.logInfo("HTTP request details", map[string]interface{}{
+		"request_id": requestID,
+		"method": httpReq.Method,
+		"url": httpReq.URL,
+		"headers_count": len(httpReq.Headers),
+		"body_size": len(httpReq.Body),
+	})
+	
+	// Output request log for JSON format
+	if tc.config.OutputFormat == "stream.json" {
+		reqLog := RequestLog{
+			RequestID: requestID,
+			Method:    httpReq.Method,
+			URL:       httpReq.URL,
+		}
+		
+		jsonData, _ := json.Marshal(reqLog)
+		fmt.Println(string(jsonData))
+	} else {
+		log.Printf("%s %s", httpReq.Method, httpReq.URL)
+	}
 
 	// Создаем локальный HTTP запрос
 	localURL := fmt.Sprintf("http://localhost:%d%s", tc.config.LocalPort, httpReq.URL)
+	
+	tc.logInfo("Creating local HTTP request", map[string]interface{}{
+		"request_id": requestID,
+		"local_url": localURL,
+	})
 	
 	var bodyReader io.Reader
 	if httpReq.Body != "" {
@@ -229,30 +466,74 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 
 	req, err := http.NewRequest(httpReq.Method, localURL, bodyReader)
 	if err != nil {
+		tc.logError("Failed to create local HTTP request", err, map[string]interface{}{
+			"request_id": requestID,
+			"local_url": localURL,
+		})
 		return tc.sendErrorResponse(requestID, fmt.Sprintf("Failed to create request: %v", err))
 	}
 
 	// Копируем заголовки (кроме Host)
+	headerCount := 0
 	for key, values := range httpReq.Headers {
 		if key != "Host" {
 			for _, value := range values {
 				req.Header.Add(key, value)
+				headerCount++
 			}
 		}
 	}
+	
+	tc.logInfo("Local request prepared", map[string]interface{}{
+		"request_id": requestID,
+		"headers_copied": headerCount,
+	})
 
 	// Выполняем запрос к локальному серверу
+	tc.logInfo("Sending request to local server", map[string]interface{}{
+		"request_id": requestID,
+		"timeout": "30s",
+	})
+	
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
+		tc.logError("Local server request failed", err, map[string]interface{}{
+			"request_id": requestID,
+			"local_url": localURL,
+		})
 		return tc.sendErrorResponse(requestID, fmt.Sprintf("Local server error: %v", err))
 	}
 	defer resp.Body.Close()
 
+	tc.logInfo("Local server responded", map[string]interface{}{
+		"request_id": requestID,
+		"status_code": resp.StatusCode,
+		"headers_count": len(resp.Header),
+	})
+
 	// Читаем ответ
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		tc.logError("Failed to read response body", err, map[string]interface{}{
+			"request_id": requestID,
+		})
 		return tc.sendErrorResponse(requestID, fmt.Sprintf("Failed to read response: %v", err))
+	}
+
+	tc.logInfo("Response body read", map[string]interface{}{
+		"request_id": requestID,
+		"body_size": len(body),
+	})
+
+	// Calculate request duration
+	tc.requestMutex.RLock()
+	requestStart, exists := tc.requestTimes[requestID]
+	tc.requestMutex.RUnlock()
+	
+	duration := ""
+	if exists {
+		duration = time.Since(requestStart).String()
 	}
 
 	// Формируем ответ
@@ -264,6 +545,32 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 
 	responseJSON, _ := json.Marshal(response)
 
+	tc.logInfo("Sending response to server", map[string]interface{}{
+		"request_id": requestID,
+		"status_code": resp.StatusCode,
+		"response_size": len(responseJSON),
+		"duration": duration,
+	})
+
+	// Output completion log for JSON format
+	if tc.config.OutputFormat == "stream.json" && duration != "" {
+		reqLog := RequestLog{
+			RequestID: requestID,
+			Method:    httpReq.Method,
+			URL:       httpReq.URL,
+			Status:    resp.StatusCode,
+			Duration:  duration,
+		}
+		
+		jsonData, _ := json.Marshal(reqLog)
+		fmt.Println(string(jsonData))
+	}
+	
+	// Clean up request time tracking
+	tc.requestMutex.Lock()
+	delete(tc.requestTimes, requestID)
+	tc.requestMutex.Unlock()
+
 	// Отправляем ответ серверу
 	return tc.conn.WriteJSON(Message{
 		Type:      "http_response",
@@ -274,6 +581,21 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 }
 
 func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
+	tc.logError("Sending error response", nil, map[string]interface{}{
+		"request_id": requestID,
+		"error_message": errorMsg,
+	})
+	
+	// Calculate request duration if available
+	tc.requestMutex.RLock()
+	requestStart, exists := tc.requestTimes[requestID]
+	tc.requestMutex.RUnlock()
+	
+	duration := ""
+	if exists {
+		duration = time.Since(requestStart).String()
+	}
+	
 	response := map[string]interface{}{
 		"status": 502,
 		"headers": map[string][]string{
@@ -284,6 +606,23 @@ func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
 
 	responseJSON, _ := json.Marshal(response)
 
+	// Output error log for JSON format
+	if tc.config.OutputFormat == "stream.json" && duration != "" {
+		reqLog := RequestLog{
+			RequestID: requestID,
+			Status:    502,
+			Duration:  duration,
+		}
+		
+		jsonData, _ := json.Marshal(reqLog)
+		fmt.Println(string(jsonData))
+	}
+	
+	// Clean up request time tracking
+	tc.requestMutex.Lock()
+	delete(tc.requestTimes, requestID)
+	tc.requestMutex.Unlock()
+
 	return tc.conn.WriteJSON(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
@@ -293,15 +632,35 @@ func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
 	})
 }
 
-func (tc *TunnelClient) startPingLoop() {
+func (tc *TunnelClient) startPingLoop(done chan struct{}) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		err := tc.conn.WriteJSON(Message{Type: "ping"})
-		if err != nil {
-			log.Printf("Ping failed: %v", err)
+	tc.logInfo("Starting ping loop", map[string]interface{}{
+		"interval": "30s",
+	})
+
+	for {
+		select {
+		case <-done:
+			tc.logInfo("Ping loop stopped", nil)
 			return
+		case <-ticker.C:
+			if tc.conn == nil {
+				tc.logWarn("Ping attempted but connection is nil", nil)
+				return
+			}
+			
+			tc.logInfo("Sending ping to server", nil)
+			
+			// Set write deadline for ping
+			tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := tc.conn.WriteJSON(Message{Type: "ping"})
+			if err != nil {
+				tc.logError("Ping failed", err, nil)
+				return
+			}
+			tc.logInfo("Ping sent successfully", nil)
 		}
 	}
 }

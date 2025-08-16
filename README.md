@@ -11,6 +11,10 @@ QTunnel is a fast, secure, and easy-to-use HTTP tunneling solution built in Go. 
 - 📦 **Easy Setup**: Simple server deployment and single-command client usage
 - 🔧 **Self-Hosted**: Complete control over your tunneling infrastructure
 - 🛠️ **Flexible**: Command-line arguments and environment variable support
+- 📊 **Comprehensive Logging**: Detailed server and client-side logging for troubleshooting
+- 🔗 **Node.js Integration**: Streaming JSON output format for programmatic monitoring
+- ⏱️ **Request Tracking**: Request timing and performance monitoring
+- 🐛 **Enhanced Debugging**: Rich error context and connection state tracking
 
 ## Quick Start
 
@@ -58,10 +62,11 @@ That's it! Your local server is now accessible via the generated HTTPS URL.
 Usage: qtunnel [options] <local_port>
 
 Options:
-  --server string    QTunnel server WebSocket URL (e.g., wss://qtunnel.example.com/ws)
-  --token string     Authentication token for the server
-  -h, --help        Show help message
-  -v, --version     Show version information
+  --server string         QTunnel server WebSocket URL (e.g., wss://qtunnel.example.com/ws)
+  --token string          Authentication token for the server
+  --output-format string  Output format: text or stream.json (default: text)
+  -h, --help             Show help message
+  -v, --version          Show version information
 
 Environment Variables (used as defaults):
   QTUNNEL_SERVER     WebSocket server URL
@@ -70,6 +75,7 @@ Environment Variables (used as defaults):
 Examples:
   qtunnel 3000
   qtunnel --server wss://tunnel.example.com/ws --token abc123 8080
+  qtunnel --output-format stream.json --server wss://tunnel.example.com/ws --token abc123 3000
   QTUNNEL_SERVER=wss://tunnel.example.com/ws qtunnel 3000
 ```
 
@@ -205,6 +211,114 @@ The client supports both command-line arguments and environment variables:
 |----------|---------------------|-------------|
 | `--server` | `QTUNNEL_SERVER` | WebSocket server URL |
 | `--token` | `QTUNNEL_AUTH_TOKEN` | Authentication token |
+| `--output-format` | - | Output format: `text` (default) or `stream.json` |
+
+## Logging and Monitoring
+
+QTunnel provides comprehensive logging capabilities for both server and client components, making it easy to troubleshoot issues and monitor tunnel performance.
+
+### Output Formats
+
+#### Text Format (Default)
+Traditional log format suitable for manual monitoring and debugging:
+
+```bash
+qtunnel --server wss://qtunnel.example.com/ws --token your-token 3000
+
+# Output:
+2025/08/16 21:59:09 [INFO] Starting QTunnel client: map[local_port:3000 server_url:wss://qtunnel.example.com/ws]
+2025/08/16 21:59:09 [INFO] WebSocket connection established
+2025/08/16 21:59:09 [INFO] Tunnel created successfully: map[domain:abc123def-tun.example.com tunnel_id:abc123def]
+GET /api/users
+2025/08/16 21:59:15 [INFO] HTTP request details: map[method:GET request_id:req789 url:/api/users]
+```
+
+#### Streaming JSON Format
+Structured JSON output perfect for Node.js applications and programmatic monitoring:
+
+```bash
+qtunnel --output-format stream.json --server wss://qtunnel.example.com/ws --token your-token 3000
+
+# Output (each line is a separate JSON object):
+{"timestamp":"2025-08-16T18:58:56Z","level":"INFO","message":"Starting QTunnel client","details":{"local_port":3000,"server_url":"wss://qtunnel.example.com/ws"}}
+{"timestamp":"2025-08-16T18:58:56Z","level":"INFO","message":"WebSocket connection established"}
+{"timestamp":"2025-08-16T18:58:56Z","level":"INFO","message":"Tunnel created successfully","details":{"tunnel_id":"abc123def","domain":"abc123def-tun.example.com","local_port":3000}}
+{"tunnel_id":"abc123def","domain":"abc123def-tun.example.com","local_port":3000,"status":"active"}
+{"request_id":"req789","method":"GET","url":"/api/users","status":200,"duration":"125ms"}
+```
+
+### Server-Side Logging
+
+The server provides detailed logging with categorized prefixes for easy filtering:
+
+- `[WS]` - WebSocket connection events
+- `[TUNNEL]` - Tunnel management operations  
+- `[HTTP]` - HTTP request/response processing
+- `[PROXY]` - Proxy server operations
+- `[PING]` - Ping/pong keepalive messages
+- `[CLEANUP]` - Tunnel cleanup operations
+
+### Client-Side Logging
+
+The client logs comprehensive information about:
+
+- Connection attempts and retries with exponential backoff
+- WebSocket communication status
+- HTTP request processing with timing
+- Local server interactions and responses
+- Error conditions with detailed context
+
+### Node.js Integration Example
+
+Use the streaming JSON format to monitor tunnels programmatically:
+
+```javascript
+const { spawn } = require('child_process');
+
+const tunnel = spawn('qtunnel', [
+  '--output-format', 'stream.json',
+  '--server', 'wss://qtunnel.example.com/ws',
+  '--token', 'your-token',
+  '3000'
+]);
+
+tunnel.stdout.on('data', (data) => {
+  const lines = data.toString().split('\n').filter(line => line.trim());
+  
+  lines.forEach(line => {
+    try {
+      const event = JSON.parse(line);
+      
+      if (event.level === 'ERROR') {
+        console.error('Tunnel error:', event.message, event.details);
+      } else if (event.status) {
+        console.log('Tunnel status:', event.status, event.domain);
+      } else if (event.request_id) {
+        console.log('Request:', event.method, event.url, 
+                   event.status ? `${event.status} (${event.duration})` : 'processing...');
+      }
+    } catch (e) {
+      // Ignore non-JSON lines
+    }
+  });
+});
+
+tunnel.on('close', (code) => {
+  console.log(`Tunnel process exited with code ${code}`);
+});
+```
+
+### Request Tracking
+
+Both output formats include request tracking with:
+
+- Unique request IDs for correlation
+- HTTP method and URL
+- Response status codes
+- Request duration timing
+- Error conditions and timeouts
+
+This makes it easy to identify performance bottlenecks and troubleshoot specific requests.
 
 ## Architecture
 
@@ -289,7 +403,7 @@ curl -fsSL https://raw.githubusercontent.com/errogaht/qtunnel/main/install.sh | 
 # Start your local development server
 npm run dev  # Running on localhost:3000
 
-# In another terminal, start tunnel
+# In another terminal, start tunnel with text output
 qtunnel --server wss://qtunnel.example.com/ws --token your-token 3000
 # Get: https://abc123def-tun.example.com
 ```
@@ -299,7 +413,7 @@ qtunnel --server wss://qtunnel.example.com/ws --token your-token 3000
 # Start your API server
 python -m http.server 8000
 
-# Tunnel it
+# Tunnel it with enhanced logging
 qtunnel --server wss://qtunnel.example.com/ws --token your-token 8000
 # Share API at: https://xyz789ghi-tun.example.com
 ```
@@ -316,6 +430,29 @@ qtunnel 8000   # API server
 qtunnel 8080   # Another service
 ```
 
+### Node.js Integration with Streaming JSON
+```bash
+# Use streaming JSON for programmatic monitoring
+qtunnel --output-format stream.json --server wss://qtunnel.example.com/ws --token your-token 3000
+
+# Or in a Node.js application
+node monitor-tunnel.js
+```
+
+### Debugging and Troubleshooting
+```bash
+# Use text format for detailed debugging
+qtunnel --output-format text --server wss://qtunnel.example.com/ws --token your-token 3000
+
+# Example output with request tracking:
+# [INFO] Starting QTunnel client
+# [INFO] WebSocket connection established  
+# [INFO] Tunnel created successfully
+# GET /api/users
+# [INFO] Local server responded: status=200
+# [INFO] Sending response to server: duration=125ms
+```
+
 ## Health Check
 
 The server provides a health check endpoint:
@@ -327,6 +464,29 @@ curl https://qtunnel.yourdomain.com/health
 
 ## Troubleshooting
 
+QTunnel now provides comprehensive logging to help diagnose issues quickly. Use the appropriate output format based on your needs:
+
+- **Text format**: For manual debugging and monitoring
+- **JSON format**: For automated monitoring and Node.js integration
+
+### Enhanced Debugging Features
+
+**Detailed Request Tracking**
+```bash
+# Enable detailed logging to see request flow
+qtunnel --output-format text --server wss://qtunnel.example.com/ws --token your-token 3000
+
+# Monitor request timing and errors
+qtunnel --output-format stream.json --server wss://qtunnel.example.com/ws --token your-token 3000 | jq '.'
+```
+
+**Connection State Monitoring**
+The client now logs detailed connection information including:
+- WebSocket connection attempts and retries
+- Authentication success/failure
+- Tunnel creation and status changes
+- Ping/pong keepalive messages
+
 ### Common Issues
 
 **1. Connection Refused**
@@ -336,12 +496,20 @@ curl -I https://qtunnel.yourdomain.com
 
 # Check WebSocket endpoint
 curl -I https://qtunnel.yourdomain.com/ws
+
+# Use enhanced logging to see connection details
+qtunnel --output-format text --server wss://qtunnel.example.com/ws --token your-token 3000
+# Look for: [INFO] Attempting WebSocket connection
+#          [ERROR] Connection attempt failed: websocket connection failed
 ```
 
 **2. Authentication Failed**
 ```bash
 # Verify your auth token matches server configuration
 echo $QTUNNEL_AUTH_TOKEN
+
+# Check server logs for authentication attempts:
+# [WS] Authentication failed for client: invalid token
 ```
 
 **3. Missing Server/Token Parameters**
@@ -364,6 +532,10 @@ nslookup random123-tun.yourdomain.com
 
 # Test direct server connection
 curl -I http://your-server-ip:8093
+
+# Monitor server logs for incoming requests:
+# [PROXY] Incoming request from IP: GET domain.com /path
+# [PROXY] Tunnel abc123 found, proxying request
 ```
 
 **5. Local Server Not Responding**
@@ -371,8 +543,30 @@ curl -I http://your-server-ip:8093
 # Verify local server is running
 curl http://localhost:YOUR_PORT
 
-# Check tunnel logs for errors
-qtunnel --server wss://qtunnel.example.com/ws --token your-token YOUR_PORT
+# Use enhanced logging to see local server interaction
+qtunnel --output-format text --server wss://qtunnel.example.com/ws --token your-token YOUR_PORT
+# Look for: [INFO] Sending request to local server
+#          [ERROR] Local server request failed: connection refused
+```
+
+**6. Request Timeout Issues**
+```bash
+# Monitor request duration and timeouts
+qtunnel --output-format stream.json --server wss://qtunnel.example.com/ws --token your-token 3000 | \
+  jq 'select(.request_id) | {method, url, status, duration}'
+
+# Server logs will show:
+# [HTTP] Request timeout for tunnel abc123, request req456 (30s)
+```
+
+**7. Performance Issues**
+```bash
+# Track request performance with JSON output
+qtunnel --output-format stream.json --server wss://qtunnel.example.com/ws --token your-token 3000 | \
+  jq 'select(.duration) | {url, status, duration}' | \
+  grep -E '"duration":"[0-9]+[ms|s]"'
+
+# Identify slow requests and bottlenecks
 ```
 
 ## Contributing
