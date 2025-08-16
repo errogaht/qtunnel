@@ -68,3 +68,7 @@ qtunnel
 
 # Local test files
 test_*
+
+# Claude Code local files (not committed)
+CLAUDE.local.md
+.claude/settings.local.json
