@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  qtunnel-server:
+    image: qtunnel-server:latest
+    build: .
+    container_name: qtunnel-server
+    restart: unless-stopped
+    environment:
+      # SECURITY: Change this token to a secure random value
+      - QTUNNEL_AUTH_TOKEN=${QTUNNEL_AUTH_TOKEN:-change-this-secure-token}
+      
+      # Your domain name
+      - QTUNNEL_DOMAIN=${QTUNNEL_DOMAIN:-yourdomain.com}
+      
+      # Internal service ports (don't change unless you know what you're doing)
+      - QTUNNEL_LISTEN=:8080
+      - QTUNNEL_PROXY=:8081
+      - QTUNNEL_TRAEFIK_DIR=/traefik-dynamic
+    ports:
+      # External ports for direct access (optional, mainly for debugging)
+      - "8092:8080"  # WebSocket port for clients
+      - "8093:8081"  # HTTP proxy port for tunnels
+    volumes:
+      # Volume for Traefik dynamic configuration files
+      - ./traefik-dynamic:/traefik-dynamic
+      # Uncomment if you want to persist logs
+      # - ./logs:/var/log/qtunnel
+    networks:
+      - traefik_network
+    labels:
+      - "traefik.enable=true"
+      
+      # WebSocket endpoint for client connections
+      - "traefik.http.routers.qtunnel-ws.rule=Host(`qtunnel.${QTUNNEL_DOMAIN:-yourdomain.com}`)"
+      - "traefik.http.routers.qtunnel-ws.tls=true"
+      - "traefik.http.routers.qtunnel-ws.tls.certresolver=${CERT_RESOLVER:-cloudflare}"
+      - "traefik.http.routers.qtunnel-ws.service=qtunnel-ws"
+      - "traefik.http.services.qtunnel-ws.loadbalancer.server.port=8080"
+      
+      # Wildcard proxy for all tunnel subdomains
+      - "traefik.http.routers.qtunnel-proxy.rule=HostRegexp(`{subdomain:[a-zA-Z0-9-]+}-tun.${QTUNNEL_DOMAIN:-yourdomain.com}`)"
+      - "traefik.http.routers.qtunnel-proxy.tls=true"
+      - "traefik.http.routers.qtunnel-proxy.tls.certresolver=${CERT_RESOLVER:-cloudflare}"
+      - "traefik.http.routers.qtunnel-proxy.service=qtunnel-proxy"
+      - "traefik.http.services.qtunnel-proxy.loadbalancer.server.port=8081"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+networks:
+  traefik_network:
+    external: true
+
+volumes:
+  traefik-dynamic:
+    driver: local
