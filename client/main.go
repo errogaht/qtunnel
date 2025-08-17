@@ -822,13 +822,13 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 	delete(tc.requestTimes, requestID)
 	tc.requestMutex.Unlock()
 
-	// Send response to server
-	return tc.writeJSON(Message{
+	// Send response to server with write timeout
+	return tc.writeJSONWithDeadline(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
 		RequestID: requestID,
 		Data:      string(responseJSON),
-	})
+	}, 10*time.Second)
 }
 
 func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
@@ -874,13 +874,13 @@ func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
 	delete(tc.requestTimes, requestID)
 	tc.requestMutex.Unlock()
 
-	return tc.writeJSON(Message{
+	return tc.writeJSONWithDeadline(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
 		RequestID: requestID,
 		Data:      string(responseJSON),
 		Error:     errorMsg,
-	})
+	}, 10*time.Second)
 }
 
 func (tc *TunnelClient) startPingLoop(done chan struct{}) {

@@ -78,14 +78,17 @@ func main() {
 		config:          config,
 	}
 
+	// Create separate mux for main server
+	mainMux := http.NewServeMux()
+	
 	// WebSocket server for clients
-	http.HandleFunc("/ws", manager.handleWebSocket)
+	mainMux.HandleFunc("/ws", manager.handleWebSocket)
 	
 	// HTTP/2 streaming server for clients  
-	http.HandleFunc("/http2", manager.handleHTTP2)
+	mainMux.HandleFunc("/http2", manager.handleHTTP2)
 	
 	// Health check endpoint
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mainMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, `{"status":"healthy","tunnels":%d}`, len(manager.tunnels))
@@ -102,9 +105,9 @@ func main() {
 	log.Printf("Domain: %s", config.Domain)
 	
 	if config.TLSCert != "" && config.TLSKey != "" {
-		log.Fatal(http.ListenAndServeTLS(config.ListenAddr, config.TLSCert, config.TLSKey, nil))
+		log.Fatal(http.ListenAndServeTLS(config.ListenAddr, config.TLSCert, config.TLSKey, mainMux))
 	} else {
-		log.Fatal(http.ListenAndServe(config.ListenAddr, nil))
+		log.Fatal(http.ListenAndServe(config.ListenAddr, mainMux))
 	}
 }
 
@@ -593,7 +596,10 @@ func generateRandomID() string {
 }
 
 func startProxyServer(manager *TunnelManager) {
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	// Create separate mux for proxy server
+	proxyMux := http.NewServeMux()
+	
+	proxyMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		clientIP := getClientIP(r)
 		log.Printf("[PROXY] Incoming request from %s: %s %s %s", clientIP, r.Method, r.Host, r.URL.Path)
 		
@@ -625,6 +631,7 @@ func startProxyServer(manager *TunnelManager) {
 
 	server := &http.Server{
 		Addr: manager.config.ProxyAddr,
+		Handler: proxyMux,
 	}
 
 	log.Fatal(server.ListenAndServe())
