@@ -28,12 +28,14 @@ type Config struct {
 }
 
 type Tunnel struct {
-	ID         string          `json:"id"`
-	Domain     string          `json:"domain"`
-	Client     *websocket.Conn `json:"-"`
-	LastSeen   time.Time       `json:"last_seen"`
-	Port       int             `json:"port"`
-	WriteMutex sync.Mutex      `json:"-"` // Prevents concurrent WebSocket writes
+	ID             string          `json:"id"`
+	Domain         string          `json:"domain"`
+	Client         *websocket.Conn `json:"-"`
+	LastSeen       time.Time       `json:"last_seen"`
+	DisconnectedAt *time.Time      `json:"disconnected_at,omitempty"` // When connection was lost
+	Connected      bool            `json:"connected"`                 // Current connection status
+	Port           int             `json:"port"`
+	WriteMutex     sync.Mutex      `json:"-"` // Prevents concurrent WebSocket writes
 }
 
 type TunnelManager struct {
@@ -225,10 +227,9 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
-	// Cleanup on disconnect
-	tm.removeTunnel(tunnel.ID)
-	tm.removeTraefikConfig(tunnel)
-	log.Printf("[TUNNEL] Tunnel removed: %s", tunnel.ID)
+	// Mark tunnel as disconnected but preserve for reconnection
+	tm.markTunnelDisconnected(tunnel.ID)
+	log.Printf("[TUNNEL] Tunnel marked as disconnected: %s (preserved for reconnection)", tunnel.ID)
 }
 
 func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string) *Tunnel {
@@ -238,8 +239,8 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 	// Check if this client already has a tunnel
 	if existingTunnelID, exists := tm.clientTunnels[clientID]; exists {
 		if existingTunnel, tunnelExists := tm.tunnels[existingTunnelID]; tunnelExists {
-			// Update existing tunnel with new connection
-			log.Printf("[TUNNEL] Reconnecting client %s to existing tunnel %s (domain: %s)", clientID, existingTunnelID, existingTunnel.Domain)
+			// Update existing tunnel with new connection (may be disconnected)
+			log.Printf("[TUNNEL] Reconnecting client %s to existing tunnel %s (domain: %s, connected: %t)", clientID, existingTunnelID, existingTunnel.Domain, existingTunnel.Connected)
 			
 			// Close old connection if it exists and is different
 			if existingTunnel.Client != nil && existingTunnel.Client != conn {
@@ -247,8 +248,11 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 				existingTunnel.Client.Close()
 			}
 			
+			// Restore connection
 			existingTunnel.Client = conn
 			existingTunnel.LastSeen = time.Now()
+			existingTunnel.Connected = true
+			existingTunnel.DisconnectedAt = nil
 			log.Printf("[TUNNEL] Successfully reconnected to tunnel %s - DOMAIN STABLE: %s", existingTunnelID, existingTunnel.Domain)
 			return existingTunnel
 		} else {
@@ -263,16 +267,31 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 	domain := fmt.Sprintf("%s-tun.%s", id, tm.config.Domain)
 
 	tunnel := &Tunnel{
-		ID:       id,
-		Domain:   domain,
-		Client:   conn,
-		LastSeen: time.Now(),
+		ID:        id,
+		Domain:    domain,
+		Client:    conn,
+		LastSeen:  time.Now(),
+		Connected: true,
 	}
 
 	tm.tunnels[id] = tunnel
 	tm.clientTunnels[clientID] = id
 	log.Printf("[TUNNEL] Created new tunnel %s for client %s (domain: %s)", id, clientID, domain)
 	return tunnel
+}
+
+// markTunnelDisconnected marks a tunnel as disconnected but preserves it for reconnection
+func (tm *TunnelManager) markTunnelDisconnected(id string) {
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+	
+	if tunnel, exists := tm.tunnels[id]; exists {
+		now := time.Now()
+		tunnel.Connected = false
+		tunnel.DisconnectedAt = &now
+		tunnel.Client = nil // Clear the connection reference
+		log.Printf("[TUNNEL] Marked tunnel %s as disconnected at %v (domain preserved: %s)", id, now, tunnel.Domain)
+	}
 }
 
 func (tm *TunnelManager) removeTunnel(id string) {
@@ -295,6 +314,10 @@ func (tm *TunnelManager) removeTunnel(id string) {
 func (tm *TunnelManager) writeToTunnel(tunnel *Tunnel, msg Message) error {
 	tunnel.WriteMutex.Lock()
 	defer tunnel.WriteMutex.Unlock()
+	
+	if !tunnel.Connected || tunnel.Client == nil {
+		return fmt.Errorf("tunnel %s is not connected", tunnel.ID)
+	}
 	
 	log.Printf("[WS-WRITE] Synchronized write to tunnel %s: type=%s, req_id=%s", 
 		tunnel.ID, msg.Type, msg.RequestID)
@@ -327,9 +350,14 @@ func startProxyServer(manager *TunnelManager) {
 			
 			tunnel := manager.getTunnel(tunnelID)
 			if tunnel != nil {
-				log.Printf("[PROXY] Tunnel %s found, proxying request", tunnelID)
-				// Proxy through WebSocket to client
-				manager.proxyRequest(tunnel, r, w)
+				if tunnel.Connected {
+					log.Printf("[PROXY] Tunnel %s found and connected, proxying request", tunnelID)
+					// Proxy through WebSocket to client
+					manager.proxyRequest(tunnel, r, w)
+				} else {
+					log.Printf("[PROXY] Tunnel %s found but disconnected", tunnelID)
+					http.Error(w, "Tunnel temporarily unavailable", http.StatusServiceUnavailable)
+				}
 			} else {
 				log.Printf("[PROXY] Tunnel %s not found", tunnelID)
 				http.Error(w, "Tunnel not found", http.StatusNotFound)
@@ -567,11 +595,38 @@ func (tm *TunnelManager) cleanup() {
 		cleanedCount := 0
 		
 		for id, tunnel := range tm.tunnels {
-			// Increased timeout from 2 minutes to 5 minutes for better reconnection tolerance
-			if time.Since(tunnel.LastSeen) > 5*time.Minute {
-				log.Printf("[CLEANUP] Tunnel %s is stale (last seen: %v ago), cleaning up", id, time.Since(tunnel.LastSeen))
+			shouldCleanup := false
+			var reason string
+			
+			if tunnel.Connected {
+				// For connected tunnels, check last activity
+				if time.Since(tunnel.LastSeen) > 5*time.Minute {
+					shouldCleanup = true
+					reason = fmt.Sprintf("connected but inactive for %v", time.Since(tunnel.LastSeen))
+				} else if time.Since(tunnel.LastSeen) > 3*time.Minute {
+					log.Printf("[CLEANUP] Warning: Connected tunnel %s approaching timeout (last seen: %v ago)", id, time.Since(tunnel.LastSeen))
+				}
+			} else {
+				// For disconnected tunnels, check disconnection time
+				if tunnel.DisconnectedAt != nil {
+					disconnectedDuration := time.Since(*tunnel.DisconnectedAt)
+					if disconnectedDuration > 5*time.Minute {
+						shouldCleanup = true
+						reason = fmt.Sprintf("disconnected for %v", disconnectedDuration)
+					} else if disconnectedDuration > 3*time.Minute {
+						log.Printf("[CLEANUP] Warning: Disconnected tunnel %s approaching cleanup (disconnected: %v ago)", id, disconnectedDuration)
+					}
+				} else {
+					// Disconnected tunnel without timestamp - cleanup immediately
+					shouldCleanup = true
+					reason = "disconnected without timestamp"
+				}
+			}
+			
+			if shouldCleanup {
+				log.Printf("[CLEANUP] Cleaning up tunnel %s (%s)", id, reason)
 				
-				// Try to close connection gracefully
+				// Try to close connection gracefully if still connected
 				if tunnel.Client != nil {
 					tunnel.Client.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server cleanup"))
 					time.Sleep(100 * time.Millisecond) // Brief pause for graceful close
@@ -590,9 +645,6 @@ func (tm *TunnelManager) cleanup() {
 				delete(tm.tunnels, id)
 				tm.removeTraefikConfig(tunnel)
 				cleanedCount++
-			} else if time.Since(tunnel.LastSeen) > 3*time.Minute {
-				// Log warning for tunnels approaching cleanup timeout
-				log.Printf("[CLEANUP] Warning: Tunnel %s approaching cleanup timeout (last seen: %v ago)", id, time.Since(tunnel.LastSeen))
 			}
 		}
 		tm.mutex.Unlock()
