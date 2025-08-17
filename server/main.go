@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -35,7 +37,13 @@ type Tunnel struct {
 	DisconnectedAt *time.Time      `json:"disconnected_at,omitempty"` // When connection was lost
 	Connected      bool            `json:"connected"`                 // Current connection status
 	Port           int             `json:"port"`
-	WriteMutex     sync.Mutex      `json:"-"` // Prevents concurrent WebSocket writes
+	WriteMutex     sync.Mutex      `json:"-"` // Prevents concurrent writes
+	
+	// HTTP/2 specific fields
+	Protocol       string          `json:"protocol"`                  // "websocket" or "http2"
+	HTTP2Writer    io.Writer       `json:"-"`                        // HTTP/2 response writer
+	HTTP2Ctx       context.Context `json:"-"`                        // HTTP/2 context
+	HTTP2Cancel    context.CancelFunc `json:"-"`                     // HTTP/2 cancellation
 }
 
 type TunnelManager struct {
@@ -72,6 +80,9 @@ func main() {
 
 	// WebSocket server for clients
 	http.HandleFunc("/ws", manager.handleWebSocket)
+	
+	// HTTP/2 streaming server for clients  
+	http.HandleFunc("/http2", manager.handleHTTP2)
 	
 	// Health check endpoint
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -117,6 +128,103 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func (tm *TunnelManager) handleHTTP2(w http.ResponseWriter, r *http.Request) {
+	clientIP := getClientIP(r)
+	log.Printf("[HTTP2] New HTTP/2 streaming connection attempt from %s", clientIP)
+	
+	// Validate request method
+	if r.Method != "POST" {
+		log.Printf("[HTTP2] Invalid method %s from client %s", r.Method, clientIP)
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	// Token verification
+	authToken := r.Header.Get("Authorization")
+	if authToken != "Bearer "+tm.config.AuthToken {
+		log.Printf("[HTTP2] Authentication failed for client %s: invalid token", clientIP)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+	
+	// Validate content type
+	if r.Header.Get("Content-Type") != "application/x-qtunnel-stream" {
+		log.Printf("[HTTP2] Invalid content type from client %s", clientIP)
+		http.Error(w, "Invalid content type", http.StatusBadRequest)
+		return
+	}
+	
+	log.Printf("[HTTP2] Client %s authenticated successfully", clientIP)
+	
+	// Get client ID from query params or header
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		clientID = r.Header.Get("X-QTunnel-Client-ID")
+	}
+	if clientID == "" {
+		log.Printf("[HTTP2] Missing client ID from %s", clientIP)
+		http.Error(w, "Missing client ID", http.StatusBadRequest)
+		return
+	}
+	
+	log.Printf("[HTTP2] Client provided ID: %s", clientID)
+	
+	// Set response headers for streaming
+	w.Header().Set("Content-Type", "application/x-qtunnel-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	
+	// Enable HTTP/2 server push if supported
+	if pusher, ok := w.(http.Pusher); ok {
+		log.Printf("[HTTP2] HTTP/2 server push supported for client %s", clientID)
+		_ = pusher // Use pusher if needed
+	}
+	
+	// Write initial response to establish connection
+	w.WriteHeader(http.StatusOK)
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		log.Printf("[HTTP2] Response writer doesn't support flushing for client %s", clientIP)
+		http.Error(w, "Streaming not supported", http.StatusInternalServerError)
+		return
+	}
+	flusher.Flush()
+	
+	log.Printf("[HTTP2] HTTP/2 streaming connection established with client %s", clientIP)
+	
+	// Create context for connection lifecycle
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	
+	// Try to find or create tunnel for this client
+	tunnel := tm.getOrCreateHTTP2Tunnel(w, ctx, cancel, clientID)
+	log.Printf("[TUNNEL] HTTP/2 tunnel for client %s: %s -> %s", clientID, tunnel.ID, tunnel.Domain)
+	
+	// Send tunnel info to client
+	err := tm.writeToTunnel(tunnel, Message{
+		Type:     "tunnel_created",
+		TunnelID: tunnel.ID,
+		Data:     tunnel.Domain,
+	})
+	if err != nil {
+		log.Printf("[TUNNEL] Error sending tunnel info to HTTP/2 client %s: %v", tunnel.ID, err)
+		http.Error(w, "Failed to send tunnel info", http.StatusInternalServerError)
+		return
+	}
+	
+	log.Printf("[TUNNEL] Tunnel info sent to HTTP/2 client %s: %s", tunnel.ID, tunnel.Domain)
+	
+	// Create Traefik config
+	tm.createTraefikConfig(tunnel)
+	
+	// Process HTTP/2 streaming messages
+	tm.processHTTP2Messages(tunnel, r.Body, ctx)
+	
+	// Cleanup on disconnect
+	tm.markTunnelDisconnected(tunnel.ID)
+	log.Printf("[TUNNEL] HTTP/2 tunnel marked as disconnected: %s", tunnel.ID)
 }
 
 func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request) {
@@ -232,6 +340,60 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 	log.Printf("[TUNNEL] Tunnel marked as disconnected: %s (preserved for reconnection)", tunnel.ID)
 }
 
+func (tm *TunnelManager) getOrCreateHTTP2Tunnel(w http.ResponseWriter, ctx context.Context, cancel context.CancelFunc, clientID string) *Tunnel {
+	tm.mutex.Lock()
+	defer tm.mutex.Unlock()
+
+	// Check if this client already has a tunnel
+	if existingTunnelID, exists := tm.clientTunnels[clientID]; exists {
+		if existingTunnel, tunnelExists := tm.tunnels[existingTunnelID]; tunnelExists {
+			// Update existing tunnel with new HTTP/2 connection
+			log.Printf("[TUNNEL] Reconnecting HTTP/2 client %s to existing tunnel %s (domain: %s, connected: %t)", clientID, existingTunnelID, existingTunnel.Domain, existingTunnel.Connected)
+			
+			// Close old HTTP/2 connection if it exists
+			if existingTunnel.HTTP2Cancel != nil {
+				log.Printf("[TUNNEL] Closing old HTTP/2 connection for tunnel %s", existingTunnelID)
+				existingTunnel.HTTP2Cancel()
+			}
+			
+			// Restore HTTP/2 connection
+			existingTunnel.Protocol = "http2"
+			existingTunnel.HTTP2Writer = w
+			existingTunnel.HTTP2Ctx = ctx
+			existingTunnel.HTTP2Cancel = cancel
+			existingTunnel.LastSeen = time.Now()
+			existingTunnel.Connected = true
+			existingTunnel.DisconnectedAt = nil
+			log.Printf("[TUNNEL] Successfully reconnected HTTP/2 to tunnel %s - DOMAIN STABLE: %s", existingTunnelID, existingTunnel.Domain)
+			return existingTunnel
+		} else {
+			// Tunnel was cleaned up, remove stale mapping
+			log.Printf("[TUNNEL] Stale tunnel mapping found for HTTP/2 client %s -> %s, removing", clientID, existingTunnelID)
+			delete(tm.clientTunnels, clientID)
+		}
+	}
+
+	// Create new tunnel
+	id := generateRandomID()
+	domain := fmt.Sprintf("%s-tun.%s", id, tm.config.Domain)
+
+	tunnel := &Tunnel{
+		ID:          id,
+		Domain:      domain,
+		Protocol:    "http2",
+		HTTP2Writer: w,
+		HTTP2Ctx:    ctx,
+		HTTP2Cancel: cancel,
+		LastSeen:    time.Now(),
+		Connected:   true,
+	}
+
+	tm.tunnels[id] = tunnel
+	tm.clientTunnels[clientID] = id
+	log.Printf("[TUNNEL] Created new HTTP/2 tunnel %s for client %s (domain: %s)", id, clientID, domain)
+	return tunnel
+}
+
 func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string) *Tunnel {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
@@ -269,6 +431,7 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 	tunnel := &Tunnel{
 		ID:        id,
 		Domain:    domain,
+		Protocol:  "websocket",
 		Client:    conn,
 		LastSeen:  time.Now(),
 		Connected: true,
@@ -310,19 +473,111 @@ func (tm *TunnelManager) removeTunnel(id string) {
 	delete(tm.tunnels, id)
 }
 
+// processHTTP2Messages reads and processes messages from HTTP/2 streaming request
+func (tm *TunnelManager) processHTTP2Messages(tunnel *Tunnel, requestBody io.Reader, ctx context.Context) {
+	log.Printf("[HTTP2] Starting message processing for tunnel %s", tunnel.ID)
+	
+	reader := bufio.NewReader(requestBody)
+	
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("[HTTP2] Message processing cancelled for tunnel %s", tunnel.ID)
+			return
+		default:
+			// Read line from HTTP/2 request stream
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					log.Printf("[HTTP2] Request stream ended for tunnel %s", tunnel.ID)
+					return
+				}
+				log.Printf("[HTTP2] Error reading from request stream for tunnel %s: %v", tunnel.ID, err)
+				return
+			}
+
+			// Parse JSON message
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue // Skip empty lines
+			}
+
+			var msg Message
+			err = json.Unmarshal([]byte(line), &msg)
+			if err != nil {
+				log.Printf("[HTTP2] Failed to parse message for tunnel %s: %v (raw: %s)", tunnel.ID, err, line)
+				continue
+			}
+
+			tunnel.LastSeen = time.Now()
+			log.Printf("[MSG] Received HTTP/2 message from tunnel %s: type=%s", tunnel.ID, msg.Type)
+			
+			// Handle different message types (same as WebSocket)
+			switch msg.Type {
+			case "ping":
+				log.Printf("[PING] HTTP/2 ping received from tunnel %s, sending pong", tunnel.ID)
+				err := tm.writeToTunnel(tunnel, Message{
+					Type: "pong",
+					TunnelID: tunnel.ID,
+				})
+				if err != nil {
+					log.Printf("[PING] Error sending HTTP/2 pong to tunnel %s: %v", tunnel.ID, err)
+					return
+				}
+			case "http_response":
+				log.Printf("[HTTP] HTTP/2 response received for tunnel %s, request %s", tunnel.ID, msg.RequestID)
+				tm.handleHTTPResponse(msg)
+			default:
+				log.Printf("[MSG] Unknown HTTP/2 message type '%s' from tunnel %s", msg.Type, tunnel.ID)
+			}
+		}
+	}
+}
+
 // writeToTunnel safely writes JSON to tunnel with mutex protection
 func (tm *TunnelManager) writeToTunnel(tunnel *Tunnel, msg Message) error {
 	tunnel.WriteMutex.Lock()
 	defer tunnel.WriteMutex.Unlock()
 	
-	if !tunnel.Connected || tunnel.Client == nil {
+	if !tunnel.Connected {
 		return fmt.Errorf("tunnel %s is not connected", tunnel.ID)
 	}
 	
-	log.Printf("[WS-WRITE] Synchronized write to tunnel %s: type=%s, req_id=%s", 
-		tunnel.ID, msg.Type, msg.RequestID)
+	log.Printf("[%s-WRITE] Synchronized write to tunnel %s: type=%s, req_id=%s", 
+		strings.ToUpper(tunnel.Protocol), tunnel.ID, msg.Type, msg.RequestID)
 	
-	return tunnel.Client.WriteJSON(msg)
+	switch tunnel.Protocol {
+	case "websocket":
+		if tunnel.Client == nil {
+			return fmt.Errorf("WebSocket client is nil for tunnel %s", tunnel.ID)
+		}
+		return tunnel.Client.WriteJSON(msg)
+	case "http2":
+		if tunnel.HTTP2Writer == nil {
+			return fmt.Errorf("HTTP/2 writer is nil for tunnel %s", tunnel.ID)
+		}
+		
+		// Serialize message to JSON
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return fmt.Errorf("failed to marshal message for tunnel %s: %v", tunnel.ID, err)
+		}
+		
+		// Send as newline-delimited JSON
+		_, err = fmt.Fprintf(tunnel.HTTP2Writer, "%s\n", string(data))
+		if err != nil {
+			return fmt.Errorf("failed to write HTTP/2 message for tunnel %s: %v", tunnel.ID, err)
+		}
+		
+		// Flush the response if possible
+		if flusher, ok := tunnel.HTTP2Writer.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		
+		return nil
+	default:
+		return fmt.Errorf("unknown protocol %s for tunnel %s", tunnel.Protocol, tunnel.ID)
+	}
 }
 
 func (tm *TunnelManager) getTunnel(id string) *Tunnel {

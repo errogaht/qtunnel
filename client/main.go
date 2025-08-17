@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	cryptorand "crypto/rand"
 	"crypto/tls"
 	"encoding/json"
@@ -19,7 +21,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"golang.org/x/net/http2"
 )
 
 var (
@@ -183,9 +184,9 @@ func main() {
 		AutoFallback:  *autoFallback,
 	}
 
-	// Create HTTP/2 client for alternative protocols
+	// Create HTTP client for alternative protocols (HTTP/1.1 compatible)
 	httpClient := &http.Client{
-		Transport: &http2.Transport{
+		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
 				InsecureSkipVerify: false,
 			},
@@ -228,6 +229,12 @@ type TunnelClient struct {
 	requestTimes  map[string]time.Time
 	requestMutex  sync.RWMutex
 	writeMutex    sync.Mutex       // Prevents concurrent writes
+	
+	// HTTP/2 specific fields
+	http2Reader   *bufio.Reader    // HTTP/2 response reader
+	http2Writer   io.WriteCloser   // HTTP/2 request writer  
+	http2Ctx      context.Context  // HTTP/2 context
+	http2Cancel   context.CancelFunc // HTTP/2 cancellation
 }
 
 func (tc *TunnelClient) logInfo(message string, details interface{}) {
@@ -250,18 +257,32 @@ func (tc *TunnelClient) logError(message string, err error, details interface{})
 	tc.outputLog("ERROR", message, errorDetails)
 }
 
-// writeJSON safely writes JSON to WebSocket with mutex protection
+// writeJSON safely writes JSON using current protocol with mutex protection
 func (tc *TunnelClient) writeJSON(msg Message) error {
 	tc.writeMutex.Lock()
 	defer tc.writeMutex.Unlock()
 	
-	tc.logInfo("WebSocket write", map[string]interface{}{
+	tc.logInfo("Protocol write", map[string]interface{}{
+		"protocol": tc.currentProto,
 		"message_type": msg.Type,
 		"request_id": msg.RequestID,
 		"goroutine": "synchronized",
 	})
 	
-	return tc.conn.WriteJSON(msg)
+	switch tc.currentProto {
+	case "websocket":
+		if tc.conn == nil {
+			return fmt.Errorf("WebSocket connection is nil")
+		}
+		return tc.conn.WriteJSON(msg)
+	case "http2":
+		return tc.http2WriteMessage(msg)
+	case "sse", "polling":
+		// TODO: Implement SSE and polling message sending
+		return fmt.Errorf("%s message sending not yet implemented", tc.currentProto)
+	default:
+		return fmt.Errorf("unknown protocol: %s", tc.currentProto)
+	}
 }
 
 // writeJSONWithDeadline safely writes JSON with deadline and mutex protection
@@ -269,8 +290,35 @@ func (tc *TunnelClient) writeJSONWithDeadline(msg Message, timeout time.Duration
 	tc.writeMutex.Lock()
 	defer tc.writeMutex.Unlock()
 	
-	tc.conn.SetWriteDeadline(time.Now().Add(timeout))
-	return tc.conn.WriteJSON(msg)
+	switch tc.currentProto {
+	case "websocket":
+		if tc.conn == nil {
+			return fmt.Errorf("WebSocket connection is nil")
+		}
+		tc.conn.SetWriteDeadline(time.Now().Add(timeout))
+		return tc.conn.WriteJSON(msg)
+	case "http2":
+		// HTTP/2 doesn't support write deadlines in the same way
+		// Use context timeout instead
+		ctx, cancel := context.WithTimeout(tc.http2Ctx, timeout)
+		defer cancel()
+		
+		done := make(chan error, 1)
+		go func() {
+			done <- tc.http2WriteMessage(msg)
+		}()
+		
+		select {
+		case err := <-done:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	case "sse", "polling":
+		return fmt.Errorf("%s deadline writes not yet implemented", tc.currentProto)
+	default:
+		return fmt.Errorf("unknown protocol: %s", tc.currentProto)
+	}
 }
 
 func (tc *TunnelClient) outputLog(level, message string, details interface{}) {
@@ -928,13 +976,222 @@ func (tc *TunnelClient) connectHTTP2() error {
 	// Replace /ws endpoint with /http2
 	serverURL = strings.Replace(serverURL, "/ws", "/http2", 1)
 	
+	// Add client ID as query parameter
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return fmt.Errorf("invalid server URL: %v", err)
+	}
+	
+	q := u.Query()
+	q.Set("client_id", tc.clientID)
+	u.RawQuery = q.Encode()
+	
 	tc.logInfo("HTTP/2 endpoint", map[string]interface{}{
-		"url": serverURL,
+		"url": u.String(),
 	})
 	
-	// TODO: Implement HTTP/2 streaming connection
-	// For now, return an error to indicate it's not implemented
-	return fmt.Errorf("HTTP/2 protocol not yet implemented - falling back to next protocol")
+	// Create context for HTTP/2 connection
+	tc.http2Ctx, tc.http2Cancel = context.WithCancel(context.Background())
+	defer func() {
+		if tc.http2Cancel != nil {
+			tc.http2Cancel()
+		}
+	}()
+	
+	// Create pipe for bidirectional communication
+	pipeReader, pipeWriter := io.Pipe()
+	tc.http2Writer = pipeWriter
+	
+	// Create HTTP/2 request with streaming body
+	req, err := http.NewRequestWithContext(tc.http2Ctx, "POST", u.String(), pipeReader)
+	if err != nil {
+		return fmt.Errorf("failed to create HTTP/2 request: %v", err)
+	}
+	
+	// Set headers for streaming and authentication
+	req.Header.Set("Content-Type", "application/x-qtunnel-stream")
+	req.Header.Set("Authorization", "Bearer "+tc.config.AuthToken)
+	req.Header.Set("X-QTunnel-Protocol", "http2")
+	req.Header.Set("X-QTunnel-Client-ID", tc.clientID)
+	
+	tc.logInfo("HTTP/2 request configured", map[string]interface{}{
+		"method": req.Method,
+		"headers": len(req.Header),
+	})
+	
+	// Send HTTP/2 request
+	resp, err := tc.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("HTTP/2 request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("HTTP/2 connection failed with status %d: %s", resp.StatusCode, string(body))
+	}
+	
+	tc.logInfo("HTTP/2 connection established", map[string]interface{}{
+		"status": resp.StatusCode,
+		"proto": resp.Proto,
+	})
+	
+	// Create response reader
+	tc.http2Reader = bufio.NewReader(resp.Body)
+	
+	// Output tunnel status
+	tc.outputTunnelStatus("connected")
+	
+	// Send initial ping to establish bidirectional communication
+	err = tc.http2WriteMessage(Message{
+		Type:     "ping",
+		TunnelID: "", // Will be set by server
+	})
+	if err != nil {
+		return fmt.Errorf("failed to send initial HTTP/2 ping: %v", err)
+	}
+	
+	// Start message processing goroutines
+	errChan := make(chan error, 2)
+	
+	// Start reading messages from server
+	go func() {
+		errChan <- tc.http2ReadLoop()
+	}()
+	
+	// Start ping loop
+	go func() {
+		errChan <- tc.http2PingLoop()
+	}()
+	
+	// Wait for error or context cancellation
+	select {
+	case err := <-errChan:
+		tc.logError("HTTP/2 connection error", err, nil)
+		tc.outputTunnelStatus("disconnected")
+		return err
+	case <-tc.http2Ctx.Done():
+		tc.logInfo("HTTP/2 connection cancelled", nil)
+		tc.outputTunnelStatus("disconnected")
+		return tc.http2Ctx.Err()
+	}
+}
+
+// http2WriteMessage sends a message through HTTP/2 streaming
+func (tc *TunnelClient) http2WriteMessage(msg Message) error {
+	if tc.http2Writer == nil {
+		return fmt.Errorf("HTTP/2 writer not initialized")
+	}
+
+	// Serialize message to JSON
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %v", err)
+	}
+
+	// Send as newline-delimited JSON
+	_, err = fmt.Fprintf(tc.http2Writer, "%s\n", string(data))
+	if err != nil {
+		return fmt.Errorf("failed to write HTTP/2 message: %v", err)
+	}
+
+	tc.logInfo("HTTP/2 message sent", map[string]interface{}{
+		"message_type": msg.Type,
+		"request_id": msg.RequestID,
+	})
+
+	return nil
+}
+
+// http2ReadLoop reads messages from HTTP/2 response stream
+func (tc *TunnelClient) http2ReadLoop() error {
+	tc.logInfo("Starting HTTP/2 read loop", nil)
+
+	for {
+		select {
+		case <-tc.http2Ctx.Done():
+			tc.logInfo("HTTP/2 read loop cancelled", nil)
+			return tc.http2Ctx.Err()
+		default:
+			// Read line from HTTP/2 response stream
+			line, err := tc.http2Reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					tc.logInfo("HTTP/2 stream ended", nil)
+					return err
+				}
+				tc.logError("HTTP/2 read error", err, nil)
+				return err
+			}
+
+			// Parse JSON message
+			line = strings.TrimSpace(line)
+			if line == "" {
+				continue // Skip empty lines
+			}
+
+			var msg Message
+			err = json.Unmarshal([]byte(line), &msg)
+			if err != nil {
+				tc.logError("Failed to parse HTTP/2 message", err, map[string]interface{}{
+					"raw_message": line,
+				})
+				continue
+			}
+
+			tc.logInfo("Received HTTP/2 message", map[string]interface{}{
+				"type": msg.Type,
+				"tunnel_id": msg.TunnelID,
+				"request_id": msg.RequestID,
+			})
+
+			// Handle message (reuse existing WebSocket message handling)
+			err = tc.handleMessage(msg)
+			if err != nil {
+				tc.logError("Error handling HTTP/2 message", err, map[string]interface{}{
+					"message_type": msg.Type,
+					"tunnel_id": msg.TunnelID,
+					"request_id": msg.RequestID,
+				})
+			}
+		}
+	}
+}
+
+// http2PingLoop sends periodic ping messages through HTTP/2
+func (tc *TunnelClient) http2PingLoop() error {
+	tc.logInfo("Starting HTTP/2 ping loop", map[string]interface{}{
+		"interval": "25s",
+	})
+
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-tc.http2Ctx.Done():
+			tc.logInfo("HTTP/2 ping loop cancelled", nil)
+			return tc.http2Ctx.Err()
+		case <-ticker.C:
+			tc.logInfo("Sending HTTP/2 ping", map[string]interface{}{
+				"client_id": tc.clientID,
+				"tunnel_id": tc.tunnelID,
+			})
+
+			err := tc.http2WriteMessage(Message{
+				Type:     "ping",
+				TunnelID: tc.tunnelID,
+			})
+			if err != nil {
+				tc.logError("HTTP/2 ping failed", err, map[string]interface{}{
+					"client_id": tc.clientID,
+				})
+				return err
+			}
+			tc.logInfo("HTTP/2 ping sent successfully", nil)
+		}
+	}
 }
 
 // connectSSE establishes connection using Server-Sent Events
