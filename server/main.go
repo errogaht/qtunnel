@@ -28,16 +28,18 @@ type Config struct {
 }
 
 type Tunnel struct {
-	ID       string          `json:"id"`
-	Domain   string          `json:"domain"`
-	Client   *websocket.Conn `json:"-"`
-	LastSeen time.Time       `json:"last_seen"`
-	Port     int             `json:"port"`
+	ID         string          `json:"id"`
+	Domain     string          `json:"domain"`
+	Client     *websocket.Conn `json:"-"`
+	LastSeen   time.Time       `json:"last_seen"`
+	Port       int             `json:"port"`
+	WriteMutex sync.Mutex      `json:"-"` // Prevents concurrent WebSocket writes
 }
 
 type TunnelManager struct {
 	tunnels        map[string]*Tunnel
 	pendingRequests map[string]chan *http.Response
+	clientTunnels  map[string]string // clientID -> tunnelID mapping for stable reconnections
 	mutex          sync.RWMutex
 	config         *Config
 }
@@ -62,6 +64,7 @@ func main() {
 	manager := &TunnelManager{
 		tunnels:         make(map[string]*Tunnel),
 		pendingRequests: make(map[string]chan *http.Response),
+		clientTunnels:   make(map[string]string),
 		config:          config,
 	}
 
@@ -137,12 +140,22 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 
 	log.Printf("[WS] WebSocket connection established with client %s", clientIP)
 
-	// Генерируем новый туннель
-	tunnel := tm.createTunnel(conn)
-	log.Printf("[TUNNEL] New tunnel created: %s -> %s (client: %s)", tunnel.ID, tunnel.Domain, clientIP)
+	// Check for client ID in query params for stable reconnection
+	clientID := r.URL.Query().Get("client_id")
+	if clientID == "" {
+		// Generate new client ID if none provided
+		clientID = generateRandomID()
+		log.Printf("[WS] Generated new client ID: %s", clientID)
+	} else {
+		log.Printf("[WS] Client provided ID: %s", clientID)
+	}
+
+	// Try to find or create tunnel for this client
+	tunnel := tm.getOrCreateTunnel(conn, clientID)
+	log.Printf("[TUNNEL] Tunnel for client %s: %s -> %s", clientID, tunnel.ID, tunnel.Domain)
 
 	// Отправляем домен клиенту
-	err = conn.WriteJSON(Message{
+	err = tm.writeToTunnel(tunnel, Message{
 		Type:     "tunnel_created",
 		TunnelID: tunnel.ID,
 		Data:     tunnel.Domain,
@@ -177,7 +190,7 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 		switch msg.Type {
 		case "ping":
 			log.Printf("[PING] Ping received from tunnel %s, sending pong", tunnel.ID)
-			err := conn.WriteJSON(Message{Type: "pong"})
+			err := tm.writeToTunnel(tunnel, Message{Type: "pong"})
 			if err != nil {
 				log.Printf("[PING] Error sending pong to tunnel %s: %v", tunnel.ID, err)
 			}
@@ -195,11 +208,25 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 	log.Printf("[TUNNEL] Tunnel removed: %s", tunnel.ID)
 }
 
-func (tm *TunnelManager) createTunnel(conn *websocket.Conn) *Tunnel {
+func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string) *Tunnel {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
 
-	// Генерируем уникальный ID
+	// Check if this client already has a tunnel
+	if existingTunnelID, exists := tm.clientTunnels[clientID]; exists {
+		if existingTunnel, tunnelExists := tm.tunnels[existingTunnelID]; tunnelExists {
+			// Update existing tunnel with new connection
+			log.Printf("[TUNNEL] Reconnecting client %s to existing tunnel %s", clientID, existingTunnelID)
+			existingTunnel.Client = conn
+			existingTunnel.LastSeen = time.Now()
+			return existingTunnel
+		} else {
+			// Tunnel was cleaned up, remove stale mapping
+			delete(tm.clientTunnels, clientID)
+		}
+	}
+
+	// Create new tunnel
 	id := generateRandomID()
 	domain := fmt.Sprintf("%s-tun.%s", id, tm.config.Domain)
 
@@ -211,13 +238,36 @@ func (tm *TunnelManager) createTunnel(conn *websocket.Conn) *Tunnel {
 	}
 
 	tm.tunnels[id] = tunnel
+	tm.clientTunnels[clientID] = id
+	log.Printf("[TUNNEL] Created new tunnel %s for client %s", id, clientID)
 	return tunnel
 }
 
 func (tm *TunnelManager) removeTunnel(id string) {
 	tm.mutex.Lock()
 	defer tm.mutex.Unlock()
+	
+	// Find and remove client mapping
+	for clientID, tunnelID := range tm.clientTunnels {
+		if tunnelID == id {
+			delete(tm.clientTunnels, clientID)
+			log.Printf("[TUNNEL] Removed client mapping %s -> %s", clientID, id)
+			break
+		}
+	}
+	
 	delete(tm.tunnels, id)
+}
+
+// writeToTunnel safely writes JSON to tunnel with mutex protection
+func (tm *TunnelManager) writeToTunnel(tunnel *Tunnel, msg Message) error {
+	tunnel.WriteMutex.Lock()
+	defer tunnel.WriteMutex.Unlock()
+	
+	log.Printf("[WS-WRITE] Synchronized write to tunnel %s: type=%s, req_id=%s", 
+		tunnel.ID, msg.Type, msg.RequestID)
+	
+	return tunnel.Client.WriteJSON(msg)
 }
 
 func (tm *TunnelManager) getTunnel(id string) *Tunnel {
@@ -292,7 +342,7 @@ func (tm *TunnelManager) proxyRequest(tunnel *Tunnel, req *http.Request, w http.
 	log.Printf("[HTTP] Request %s serialized, sending to tunnel %s", requestID, tunnel.ID)
 	
 	// Отправляем клиенту
-	err = tunnel.Client.WriteJSON(Message{
+	err = tm.writeToTunnel(tunnel, Message{
 		Type:      "http_request",
 		TunnelID:  tunnel.ID,
 		RequestID: requestID,
@@ -488,6 +538,16 @@ func (tm *TunnelManager) cleanup() {
 			if time.Since(tunnel.LastSeen) > 2*time.Minute {
 				log.Printf("[CLEANUP] Tunnel %s is stale (last seen: %v ago), cleaning up", id, time.Since(tunnel.LastSeen))
 				tunnel.Client.Close()
+				
+				// Remove client mapping
+				for clientID, tunnelID := range tm.clientTunnels {
+					if tunnelID == id {
+						delete(tm.clientTunnels, clientID)
+						log.Printf("[CLEANUP] Removed client mapping %s -> %s", clientID, id)
+						break
+					}
+				}
+				
 				delete(tm.tunnels, id)
 				tm.removeTraefikConfig(tunnel)
 				cleanedCount++

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -163,13 +164,16 @@ func main() {
 
 	client := &TunnelClient{
 		config:       config,
+		clientID:     generateClientID(),
 		requestTimes: make(map[string]time.Time),
 	}
 
 	client.logInfo("Starting QTunnel client", map[string]interface{}{
-		"server_url":  config.ServerURL,
-		"local_port":  localPort,
+		"server_url":    config.ServerURL,
+		"local_port":    localPort,
 		"output_format": config.OutputFormat,
+		"client_id":     client.clientID,
+		"process_id":    os.Getpid(),
 	})
 
 	err = client.Connect()
@@ -184,8 +188,10 @@ type TunnelClient struct {
 	conn          *websocket.Conn
 	tunnelID      string
 	domain        string
+	clientID      string // Stable client ID for reconnections
 	requestTimes  map[string]time.Time
 	requestMutex  sync.RWMutex
+	writeMutex    sync.Mutex // Prevents concurrent WebSocket writes
 }
 
 func (tc *TunnelClient) logInfo(message string, details interface{}) {
@@ -206,6 +212,29 @@ func (tc *TunnelClient) logError(message string, err error, details interface{})
 		}
 	}
 	tc.outputLog("ERROR", message, errorDetails)
+}
+
+// writeJSON safely writes JSON to WebSocket with mutex protection
+func (tc *TunnelClient) writeJSON(msg Message) error {
+	tc.writeMutex.Lock()
+	defer tc.writeMutex.Unlock()
+	
+	tc.logInfo("WebSocket write", map[string]interface{}{
+		"message_type": msg.Type,
+		"request_id": msg.RequestID,
+		"goroutine": "synchronized",
+	})
+	
+	return tc.conn.WriteJSON(msg)
+}
+
+// writeJSONWithDeadline safely writes JSON with deadline and mutex protection
+func (tc *TunnelClient) writeJSONWithDeadline(msg Message, timeout time.Duration) error {
+	tc.writeMutex.Lock()
+	defer tc.writeMutex.Unlock()
+	
+	tc.conn.SetWriteDeadline(time.Now().Add(timeout))
+	return tc.conn.WriteJSON(msg)
 }
 
 func (tc *TunnelClient) outputLog(level, message string, details interface{}) {
@@ -298,6 +327,7 @@ func (tc *TunnelClient) Connect() error {
 func (tc *TunnelClient) connectOnce() error {
 	tc.logInfo("Parsing server URL", map[string]interface{}{
 		"url": tc.config.ServerURL,
+		"client_id": tc.clientID,
 	})
 	
 	// Парсим URL сервера
@@ -305,6 +335,11 @@ func (tc *TunnelClient) connectOnce() error {
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %v", err)
 	}
+	
+	// Add client ID as query parameter for stable reconnection
+	q := u.Query()
+	q.Set("client_id", tc.clientID)
+	u.RawQuery = q.Encode()
 
 	tc.logInfo("Preparing WebSocket connection", map[string]interface{}{
 		"scheme": u.Scheme,
@@ -374,14 +409,38 @@ func (tc *TunnelClient) connectOnce() error {
 func (tc *TunnelClient) handleMessage(msg Message) error {
 	switch msg.Type {
 	case "tunnel_created":
+		// Check if we're reconnecting to existing tunnel
+		previousTunnelID := tc.tunnelID
+		previousDomain := tc.domain
+		
 		tc.tunnelID = msg.TunnelID
 		tc.domain = msg.Data
 		
-		tc.logInfo("Tunnel created successfully", map[string]interface{}{
-			"tunnel_id": tc.tunnelID,
-			"domain": tc.domain,
-			"local_port": tc.config.LocalPort,
-		})
+		if previousTunnelID != "" && previousTunnelID != tc.tunnelID {
+			tc.logWarn("Tunnel URL changed during reconnection", map[string]interface{}{
+				"previous_tunnel_id": previousTunnelID,
+				"previous_domain": previousDomain,
+				"new_tunnel_id": tc.tunnelID,
+				"new_domain": tc.domain,
+				"reason": "Previous tunnel was cleaned up or client_id changed",
+				"client_id": tc.clientID,
+			})
+		} else if previousTunnelID == tc.tunnelID {
+			tc.logInfo("Reconnected to existing tunnel - URL STABLE", map[string]interface{}{
+				"tunnel_id": tc.tunnelID,
+				"domain": tc.domain,
+				"client_id": tc.clientID,
+				"message": "Same domain maintained across reconnection",
+			})
+		} else {
+			tc.logInfo("New tunnel created", map[string]interface{}{
+				"tunnel_id": tc.tunnelID,
+				"domain": tc.domain,
+				"local_port": tc.config.LocalPort,
+				"client_id": tc.clientID,
+				"message": "Fresh tunnel for new client process",
+			})
+		}
 		
 		tc.outputTunnelStatus("active")
 		
@@ -572,7 +631,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 	tc.requestMutex.Unlock()
 
 	// Отправляем ответ серверу
-	return tc.conn.WriteJSON(Message{
+	return tc.writeJSON(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
 		RequestID: requestID,
@@ -623,7 +682,7 @@ func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
 	delete(tc.requestTimes, requestID)
 	tc.requestMutex.Unlock()
 
-	return tc.conn.WriteJSON(Message{
+	return tc.writeJSON(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
 		RequestID: requestID,
@@ -653,9 +712,8 @@ func (tc *TunnelClient) startPingLoop(done chan struct{}) {
 			
 			tc.logInfo("Sending ping to server", nil)
 			
-			// Set write deadline for ping
-			tc.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			err := tc.conn.WriteJSON(Message{Type: "ping"})
+			// Send ping with write synchronization
+			err := tc.writeJSONWithDeadline(Message{Type: "ping"}, 10*time.Second)
 			if err != nil {
 				tc.logError("Ping failed", err, nil)
 				return
@@ -670,4 +728,21 @@ func getEnv(key, defaultValue string) string {
 		return value
 	}
 	return defaultValue
+}
+
+func generateClientID() string {
+	// Generate unique client ID for this process instance
+	// New process = new clientID = new tunnel domain
+	// Same process reconnecting = same clientID = same tunnel domain
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	
+	processID := os.Getpid()
+	timestamp := time.Now().UnixNano() // Use nanoseconds for better uniqueness
+	randomBytes := make([]byte, 8)     // Use more random bytes
+	rand.Read(randomBytes)
+	
+	return fmt.Sprintf("%s-%d-%d-%x", hostname, processID, timestamp, randomBytes)
 }
