@@ -1019,31 +1019,20 @@ func (tc *TunnelClient) connectHTTP2() error {
 		"headers": len(req.Header),
 	})
 	
-	// Send HTTP/2 request
-	resp, err := tc.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP/2 request failed: %v", err)
-	}
-	defer resp.Body.Close()
+	// Start HTTP/2 request in goroutine to avoid deadlock
+	respChan := make(chan *http.Response, 1)
+	errChan := make(chan error, 1)
 	
-	// Check response status
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("HTTP/2 connection failed with status %d: %s", resp.StatusCode, string(body))
-	}
+	go func() {
+		resp, err := tc.httpClient.Do(req)
+		if err != nil {
+			errChan <- fmt.Errorf("HTTP/2 request failed: %v", err)
+			return
+		}
+		respChan <- resp
+	}()
 	
-	tc.logInfo("HTTP/2 connection established", map[string]interface{}{
-		"status": resp.StatusCode,
-		"proto": resp.Proto,
-	})
-	
-	// Create response reader
-	tc.http2Reader = bufio.NewReader(resp.Body)
-	
-	// Output tunnel status
-	tc.outputTunnelStatus("connected")
-	
-	// Send initial ping to establish bidirectional communication
+	// Send initial ping immediately to start communication
 	err = tc.http2WriteMessage(Message{
 		Type:     "ping",
 		TunnelID: "", // Will be set by server
@@ -1052,22 +1041,53 @@ func (tc *TunnelClient) connectHTTP2() error {
 		return fmt.Errorf("failed to send initial HTTP/2 ping: %v", err)
 	}
 	
+	tc.logInfo("HTTP/2 ping sent, waiting for response", nil)
+	
+	// Wait for HTTP response
+	var resp *http.Response
+	select {
+	case resp = <-respChan:
+		defer resp.Body.Close()
+		
+		// Check response status
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("HTTP/2 connection failed with status %d: %s", resp.StatusCode, string(body))
+		}
+		
+		tc.logInfo("HTTP/2 connection established", map[string]interface{}{
+			"status": resp.StatusCode,
+			"proto": resp.Proto,
+		})
+		
+		// Create response reader
+		tc.http2Reader = bufio.NewReader(resp.Body)
+		
+		// Output tunnel status
+		tc.outputTunnelStatus("connected")
+		
+	case err := <-errChan:
+		return err
+	case <-tc.http2Ctx.Done():
+		return fmt.Errorf("HTTP/2 connection timeout")
+	}
+	
 	// Start message processing goroutines
-	errChan := make(chan error, 2)
+	processErrChan := make(chan error, 2)
 	
 	// Start reading messages from server
 	go func() {
-		errChan <- tc.http2ReadLoop()
+		processErrChan <- tc.http2ReadLoop()
 	}()
 	
 	// Start ping loop
 	go func() {
-		errChan <- tc.http2PingLoop()
+		processErrChan <- tc.http2PingLoop()
 	}()
 	
 	// Wait for error or context cancellation
 	select {
-	case err := <-errChan:
+	case err := <-processErrChan:
 		tc.logError("HTTP/2 connection error", err, nil)
 		tc.outputTunnelStatus("disconnected")
 		return err
