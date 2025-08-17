@@ -2,16 +2,18 @@ package main
 
 import (
 	"bytes"
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -284,44 +286,67 @@ func (tc *TunnelClient) outputTunnelStatus(status string) {
 }
 
 func (tc *TunnelClient) Connect() error {
-	maxRetries := 5
-	retryDelay := 5 * time.Second
+	retryCount := 0
+	maxRetries := 10 // Increased from 5
+	baseDelay := 2 * time.Second // Reduced initial delay
+	maxDelay := 30 * time.Second // Cap maximum delay
 
 	tc.logInfo("Starting connection process", map[string]interface{}{
 		"max_retries": maxRetries,
-		"initial_delay": retryDelay.String(),
+		"base_delay": baseDelay.String(),
+		"max_delay": maxDelay.String(),
 	})
 
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
+	for {
+		if retryCount > 0 {
+			// Calculate delay with exponential backoff and jitter
+			multiplier := 1 << uint(retryCount-1) // Exponential backoff: 1, 2, 4, 8, etc.
+			delay := time.Duration(int64(baseDelay) * int64(multiplier))
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			// Add jitter to prevent thundering herd
+			jitter := time.Duration(rand.Int63n(int64(delay / 4)))
+			finalDelay := delay + jitter
+			
 			tc.logInfo("Retrying connection", map[string]interface{}{
-				"attempt": retry + 1,
+				"attempt": retryCount + 1,
 				"max_attempts": maxRetries,
-				"delay": retryDelay.String(),
+				"delay": finalDelay.String(),
+				"client_id": tc.clientID,
 			})
-			time.Sleep(retryDelay)
-			retryDelay *= 2 // Exponential backoff
+			time.Sleep(finalDelay)
 		}
 
 		err := tc.connectOnce()
 		if err != nil {
+			retryCount++
 			tc.logError("Connection attempt failed", err, map[string]interface{}{
-				"attempt": retry + 1,
+				"attempt": retryCount,
 				"max_attempts": maxRetries,
+				"error_type": fmt.Sprintf("%T", err),
 			})
+			
+			// Check if we should stop retrying
+			if retryCount >= maxRetries {
+				tc.logError("Max retry attempts exceeded", nil, map[string]interface{}{
+					"total_attempts": retryCount,
+					"last_error": err.Error(),
+				})
+				return fmt.Errorf("failed to establish stable connection after %d attempts: %v", retryCount, err)
+			}
 			continue
 		}
 
-		// If we get here, connection was successful but lost - retry
+		// Connection was successful but was lost - reset retry count for faster reconnection
+		if retryCount > 3 {
+			retryCount = 3 // Reset but keep some backoff
+		}
 		tc.logWarn("Connection lost, retrying", map[string]interface{}{
-			"attempt": retry + 1,
+			"previous_attempts": retryCount,
+			"client_id": tc.clientID,
 		})
 	}
-
-	tc.logError("Failed to establish stable connection", nil, map[string]interface{}{
-		"max_attempts": maxRetries,
-	})
-	return fmt.Errorf("failed to establish stable connection after %d attempts", maxRetries)
 }
 
 func (tc *TunnelClient) connectOnce() error {
@@ -345,20 +370,39 @@ func (tc *TunnelClient) connectOnce() error {
 		"scheme": u.Scheme,
 		"host": u.Host,
 		"path": u.Path,
+		"query": u.RawQuery,
 	})
 
 	// Add authorization header
 	headers := http.Header{}
 	headers.Add("Authorization", "Bearer "+tc.config.AuthToken)
 
-	tc.logInfo("Attempting WebSocket connection", nil)
+	// Configure dialer with timeouts
+	dialer := websocket.Dialer{
+		HandshakeTimeout: 15 * time.Second,
+		ReadBufferSize:   4096,
+		WriteBufferSize:  4096,
+	}
+
+	tc.logInfo("Attempting WebSocket connection", map[string]interface{}{
+		"handshake_timeout": "15s",
+	})
 	
 	// Connect to server
-	tc.conn, _, err = websocket.DefaultDialer.Dial(u.String(), headers)
+	tc.conn, _, err = dialer.Dial(u.String(), headers)
 	if err != nil {
 		return fmt.Errorf("websocket connection failed: %v", err)
 	}
 	defer tc.conn.Close()
+
+	// Set connection timeouts and limits
+	tc.conn.SetReadLimit(1024 * 1024) // 1MB message limit
+	tc.conn.SetPongHandler(func(appData string) error {
+		tc.logInfo("Pong handler triggered", map[string]interface{}{
+			"app_data": appData,
+		})
+		return nil
+	})
 
 	tc.logInfo("WebSocket connection established", nil)
 	tc.outputTunnelStatus("connected")
@@ -372,19 +416,37 @@ func (tc *TunnelClient) connectOnce() error {
 	
 	// Process messages from server
 	for {
-		// Set read deadline to detect dead connections
-		tc.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		// Set read deadline with longer timeout for better stability
+		tc.conn.SetReadDeadline(time.Now().Add(90 * time.Second))
 		
 		var msg Message
 		err := tc.conn.ReadJSON(&msg)
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				tc.logError("Unexpected WebSocket close", err, nil)
+			// Enhanced error classification
+			closeCode := websocket.CloseNoStatusReceived
+			if closeErr, ok := err.(*websocket.CloseError); ok {
+				closeCode = closeErr.Code
+			}
+			
+			errorDetails := map[string]interface{}{
+				"error_type": fmt.Sprintf("%T", err),
+				"close_code": closeCode,
+				"is_timeout": strings.Contains(err.Error(), "timeout"),
+				"is_network": strings.Contains(err.Error(), "i/o timeout") || strings.Contains(err.Error(), "network"),
+			}
+			
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
+				tc.logError("Unexpected WebSocket close", err, errorDetails)
 			} else {
-				tc.logError("Error reading message from server", err, nil)
+				tc.logError("WebSocket connection error", err, errorDetails)
 			}
 			tc.outputTunnelStatus("disconnected")
-			break
+			
+			// Return different error types for better retry logic
+			if strings.Contains(err.Error(), "i/o timeout") {
+				return fmt.Errorf("network timeout: %v", err)
+			}
+			return err
 		}
 
 		tc.logInfo("Received message from server", map[string]interface{}{
@@ -692,11 +754,11 @@ func (tc *TunnelClient) sendErrorResponse(requestID, errorMsg string) error {
 }
 
 func (tc *TunnelClient) startPingLoop(done chan struct{}) {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(25 * time.Second) // Slightly more frequent
 	defer ticker.Stop()
 
 	tc.logInfo("Starting ping loop", map[string]interface{}{
-		"interval": "30s",
+		"interval": "25s",
 	})
 
 	for {
@@ -710,12 +772,21 @@ func (tc *TunnelClient) startPingLoop(done chan struct{}) {
 				return
 			}
 			
-			tc.logInfo("Sending ping to server", nil)
+			tc.logInfo("Sending ping to server", map[string]interface{}{
+				"client_id": tc.clientID,
+				"tunnel_id": tc.tunnelID,
+			})
 			
-			// Send ping with write synchronization
-			err := tc.writeJSONWithDeadline(Message{Type: "ping"}, 10*time.Second)
+			// Send ping with write synchronization and longer timeout
+			err := tc.writeJSONWithDeadline(Message{
+				Type: "ping",
+				TunnelID: tc.tunnelID, // Include tunnel ID to help server correlate
+			}, 15*time.Second)
 			if err != nil {
-				tc.logError("Ping failed", err, nil)
+				tc.logError("Ping failed", err, map[string]interface{}{
+					"client_id": tc.clientID,
+					"error_type": fmt.Sprintf("%T", err),
+				})
 				return
 			}
 			tc.logInfo("Ping sent successfully", nil)
@@ -742,7 +813,7 @@ func generateClientID() string {
 	processID := os.Getpid()
 	timestamp := time.Now().UnixNano() // Use nanoseconds for better uniqueness
 	randomBytes := make([]byte, 8)     // Use more random bytes
-	rand.Read(randomBytes)
+	cryptorand.Read(randomBytes)
 	
 	return fmt.Sprintf("%s-%d-%d-%x", hostname, processID, timestamp, randomBytes)
 }

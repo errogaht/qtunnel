@@ -138,6 +138,13 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 	}
 	defer conn.Close()
 
+	// Configure connection settings for better stability
+	conn.SetReadLimit(1024 * 1024) // 1MB message limit
+	conn.SetPongHandler(func(appData string) error {
+		log.Printf("[WS] Pong received from client %s", clientIP)
+		return nil
+	})
+
 	log.Printf("[WS] WebSocket connection established with client %s", clientIP)
 
 	// Check for client ID in query params for stable reconnection
@@ -172,13 +179,24 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 
 	// Process messages from client
 	for {
+		// Set read deadline for connection health
+		conn.SetReadDeadline(time.Now().Add(90 * time.Second))
+		
 		var msg Message
 		err := conn.ReadJSON(&msg)
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("[TUNNEL] Unexpected WebSocket close for tunnel %s: %v", tunnel.ID, err)
+			// Enhanced error logging
+			errorDetails := map[string]interface{}{
+				"client_ip": clientIP,
+				"tunnel_id": tunnel.ID,
+				"error_type": fmt.Sprintf("%T", err),
+				"is_timeout": strings.Contains(err.Error(), "timeout"),
+			}
+			
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNoStatusReceived) {
+				log.Printf("[TUNNEL] Unexpected WebSocket close for tunnel %s: %v (details: %+v)", tunnel.ID, err, errorDetails)
 			} else {
-				log.Printf("[TUNNEL] Client %s disconnected: %v", tunnel.ID, err)
+				log.Printf("[TUNNEL] Client %s disconnected: %v (details: %+v)", tunnel.ID, err, errorDetails)
 			}
 			break
 		}
@@ -190,9 +208,14 @@ func (tm *TunnelManager) handleWebSocket(w http.ResponseWriter, r *http.Request)
 		switch msg.Type {
 		case "ping":
 			log.Printf("[PING] Ping received from tunnel %s, sending pong", tunnel.ID)
-			err := tm.writeToTunnel(tunnel, Message{Type: "pong"})
+			err := tm.writeToTunnel(tunnel, Message{
+				Type: "pong",
+				TunnelID: tunnel.ID, // Echo back tunnel ID for client verification
+			})
 			if err != nil {
 				log.Printf("[PING] Error sending pong to tunnel %s: %v", tunnel.ID, err)
+				// Ping/pong failure often indicates connection issues
+				break
 			}
 		case "http_response":
 			log.Printf("[HTTP] HTTP response received for tunnel %s, request %s", tunnel.ID, msg.RequestID)
@@ -216,12 +239,21 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 	if existingTunnelID, exists := tm.clientTunnels[clientID]; exists {
 		if existingTunnel, tunnelExists := tm.tunnels[existingTunnelID]; tunnelExists {
 			// Update existing tunnel with new connection
-			log.Printf("[TUNNEL] Reconnecting client %s to existing tunnel %s", clientID, existingTunnelID)
+			log.Printf("[TUNNEL] Reconnecting client %s to existing tunnel %s (domain: %s)", clientID, existingTunnelID, existingTunnel.Domain)
+			
+			// Close old connection if it exists and is different
+			if existingTunnel.Client != nil && existingTunnel.Client != conn {
+				log.Printf("[TUNNEL] Closing old connection for tunnel %s", existingTunnelID)
+				existingTunnel.Client.Close()
+			}
+			
 			existingTunnel.Client = conn
 			existingTunnel.LastSeen = time.Now()
+			log.Printf("[TUNNEL] Successfully reconnected to tunnel %s - DOMAIN STABLE: %s", existingTunnelID, existingTunnel.Domain)
 			return existingTunnel
 		} else {
 			// Tunnel was cleaned up, remove stale mapping
+			log.Printf("[TUNNEL] Stale tunnel mapping found for client %s -> %s, removing", clientID, existingTunnelID)
 			delete(tm.clientTunnels, clientID)
 		}
 	}
@@ -239,7 +271,7 @@ func (tm *TunnelManager) getOrCreateTunnel(conn *websocket.Conn, clientID string
 
 	tm.tunnels[id] = tunnel
 	tm.clientTunnels[clientID] = id
-	log.Printf("[TUNNEL] Created new tunnel %s for client %s", id, clientID)
+	log.Printf("[TUNNEL] Created new tunnel %s for client %s (domain: %s)", id, clientID, domain)
 	return tunnel
 }
 
@@ -524,10 +556,10 @@ func (tm *TunnelManager) removeTraefikConfig(tunnel *Tunnel) {
 }
 
 func (tm *TunnelManager) cleanup() {
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(45 * time.Second) // Longer interval
 	defer ticker.Stop()
 	
-	log.Printf("[CLEANUP] Starting tunnel cleanup routine")
+	log.Printf("[CLEANUP] Starting tunnel cleanup routine with 5-minute timeout")
 
 	for range ticker.C {
 		tm.mutex.Lock()
@@ -535,9 +567,16 @@ func (tm *TunnelManager) cleanup() {
 		cleanedCount := 0
 		
 		for id, tunnel := range tm.tunnels {
-			if time.Since(tunnel.LastSeen) > 2*time.Minute {
+			// Increased timeout from 2 minutes to 5 minutes for better reconnection tolerance
+			if time.Since(tunnel.LastSeen) > 5*time.Minute {
 				log.Printf("[CLEANUP] Tunnel %s is stale (last seen: %v ago), cleaning up", id, time.Since(tunnel.LastSeen))
-				tunnel.Client.Close()
+				
+				// Try to close connection gracefully
+				if tunnel.Client != nil {
+					tunnel.Client.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseGoingAway, "Server cleanup"))
+					time.Sleep(100 * time.Millisecond) // Brief pause for graceful close
+					tunnel.Client.Close()
+				}
 				
 				// Remove client mapping
 				for clientID, tunnelID := range tm.clientTunnels {
@@ -551,6 +590,9 @@ func (tm *TunnelManager) cleanup() {
 				delete(tm.tunnels, id)
 				tm.removeTraefikConfig(tunnel)
 				cleanedCount++
+			} else if time.Since(tunnel.LastSeen) > 3*time.Minute {
+				// Log warning for tunnels approaching cleanup timeout
+				log.Printf("[CLEANUP] Warning: Tunnel %s approaching cleanup timeout (last seen: %v ago)", id, time.Since(tunnel.LastSeen))
 			}
 		}
 		tm.mutex.Unlock()
