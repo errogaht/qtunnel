@@ -1032,6 +1032,43 @@ func (tc *TunnelClient) connectHTTP2() error {
 		respChan <- resp
 	}()
 	
+	// Start message processing goroutines immediately to avoid deadlock
+	processErrChan := make(chan error, 3)
+	
+	// Handle HTTP response asynchronously
+	go func() {
+		select {
+		case resp := <-respChan:
+			defer resp.Body.Close()
+			
+			// Check response status
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				processErrChan <- fmt.Errorf("HTTP/2 connection failed with status %d: %s", resp.StatusCode, string(body))
+				return
+			}
+			
+			tc.logInfo("HTTP/2 connection established", map[string]interface{}{
+				"status": resp.StatusCode,
+				"proto": resp.Proto,
+			})
+			
+			// Create response reader
+			tc.http2Reader = bufio.NewReader(resp.Body)
+			
+			// Output tunnel status
+			tc.outputTunnelStatus("connected")
+			
+			// Start reading messages from server
+			processErrChan <- tc.http2ReadLoop()
+			
+		case err := <-errChan:
+			processErrChan <- err
+		case <-tc.http2Ctx.Done():
+			processErrChan <- fmt.Errorf("HTTP/2 connection timeout")
+		}
+	}()
+	
 	// Send initial ping immediately to start communication
 	err = tc.http2WriteMessage(Message{
 		Type:     "ping",
@@ -1041,46 +1078,9 @@ func (tc *TunnelClient) connectHTTP2() error {
 		return fmt.Errorf("failed to send initial HTTP/2 ping: %v", err)
 	}
 	
-	tc.logInfo("HTTP/2 ping sent, waiting for response", nil)
+	tc.logInfo("HTTP/2 ping sent, starting message loops", nil)
 	
-	// Wait for HTTP response
-	var resp *http.Response
-	select {
-	case resp = <-respChan:
-		defer resp.Body.Close()
-		
-		// Check response status
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("HTTP/2 connection failed with status %d: %s", resp.StatusCode, string(body))
-		}
-		
-		tc.logInfo("HTTP/2 connection established", map[string]interface{}{
-			"status": resp.StatusCode,
-			"proto": resp.Proto,
-		})
-		
-		// Create response reader
-		tc.http2Reader = bufio.NewReader(resp.Body)
-		
-		// Output tunnel status
-		tc.outputTunnelStatus("connected")
-		
-	case err := <-errChan:
-		return err
-	case <-tc.http2Ctx.Done():
-		return fmt.Errorf("HTTP/2 connection timeout")
-	}
-	
-	// Start message processing goroutines
-	processErrChan := make(chan error, 2)
-	
-	// Start reading messages from server
-	go func() {
-		processErrChan <- tc.http2ReadLoop()
-	}()
-	
-	// Start ping loop
+	// Start ping loop immediately
 	go func() {
 		processErrChan <- tc.http2PingLoop()
 	}()
