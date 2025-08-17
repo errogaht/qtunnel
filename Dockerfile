@@ -1,36 +1,36 @@
-# Сборка
+# Build stage
 FROM golang:1.21-alpine AS builder
 
 WORKDIR /app
 
-# Копируем go.mod и go.sum
+# Copy go.mod and go.sum
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Копируем исходный код
+# Copy source code
 COPY . .
 
-# Собираем сервер
+# Build server
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o qtunnel-server ./server
 
-# Собираем клиент
+# Build client
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o qtunnel-client ./client
 
-# Финальный образ
+# Final image
 FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 WORKDIR /root/
 
-# Копируем бинарники
+# Copy binaries
 COPY --from=builder /app/qtunnel-server .
 COPY --from=builder /app/qtunnel-client .
 
-# Создаем директорию для Traefik конфигов
+# Create directory for Traefik configurations
 RUN mkdir -p /etc/traefik/dynamic
 
-# Открываем порты
+# Expose ports
 EXPOSE 8080 8081
 
-# Запускаем сервер
+# Start server
 CMD ["./qtunnel-server"]

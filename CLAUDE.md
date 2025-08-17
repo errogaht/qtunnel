@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## 🌍 IMPORTANT: English-Only Project
+
+**This is an English-only project.** ALL code, comments, documentation, commit messages, and communication MUST be in English.
+
+**Key Rules:**
+- **Always write in English** - even if the user communicates in Russian or other languages
+- **Translate any non-English content** - if you find comments, documentation, or code in other languages, translate them to English
+- **Maintain English standards** - use proper English grammar and technical terminology
+- **No mixed languages** - avoid mixing English with other languages in the same context
+
+**Example:**
+- ❌ `// Парсим URL сервера` 
+- ✅ `// Parse server URL`
+
+This ensures the project remains accessible to the global developer community.
+
 ## Project Overview
 
 QTunnel is a secure HTTP tunneling solution built in Go that allows exposing local development servers to the internet through encrypted WebSocket tunnels with automatically generated random subdomains and HTTPS certificates.

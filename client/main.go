@@ -330,7 +330,7 @@ func (tc *TunnelClient) connectOnce() error {
 		"client_id": tc.clientID,
 	})
 	
-	// Парсим URL сервера
+	// Parse server URL
 	u, err := url.Parse(tc.config.ServerURL)
 	if err != nil {
 		return fmt.Errorf("invalid server URL: %v", err)
@@ -347,13 +347,13 @@ func (tc *TunnelClient) connectOnce() error {
 		"path": u.Path,
 	})
 
-	// Добавляем заголовок авторизации
+	// Add authorization header
 	headers := http.Header{}
 	headers.Add("Authorization", "Bearer "+tc.config.AuthToken)
 
 	tc.logInfo("Attempting WebSocket connection", nil)
 	
-	// Подключаемся к серверу
+	// Connect to server
 	tc.conn, _, err = websocket.DefaultDialer.Dial(u.String(), headers)
 	if err != nil {
 		return fmt.Errorf("websocket connection failed: %v", err)
@@ -370,7 +370,7 @@ func (tc *TunnelClient) connectOnce() error {
 
 	tc.logInfo("Starting message processing loop", nil)
 	
-	// Обрабатываем сообщения от сервера
+	// Process messages from server
 	for {
 		// Set read deadline to detect dead connections
 		tc.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
@@ -478,7 +478,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		"request_id": requestID,
 	})
 	
-	// Парсим HTTP запрос
+	// Parse HTTP request
 	var httpReq HTTPRequest
 	err := json.Unmarshal([]byte(data), &httpReq)
 	if err != nil {
@@ -510,7 +510,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		log.Printf("%s %s", httpReq.Method, httpReq.URL)
 	}
 
-	// Создаем локальный HTTP запрос
+	// Create local HTTP request
 	localURL := fmt.Sprintf("http://localhost:%d%s", tc.config.LocalPort, httpReq.URL)
 	
 	tc.logInfo("Creating local HTTP request", map[string]interface{}{
@@ -532,7 +532,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		return tc.sendErrorResponse(requestID, fmt.Sprintf("Failed to create request: %v", err))
 	}
 
-	// Копируем заголовки (кроме Host)
+	// Copy headers (except Host)
 	headerCount := 0
 	for key, values := range httpReq.Headers {
 		if key != "Host" {
@@ -548,7 +548,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		"headers_copied": headerCount,
 	})
 
-	// Выполняем запрос к локальному серверу
+	// Execute request to local server
 	tc.logInfo("Sending request to local server", map[string]interface{}{
 		"request_id": requestID,
 		"timeout": "30s",
@@ -571,7 +571,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		"headers_count": len(resp.Header),
 	})
 
-	// Читаем ответ
+	// Read response
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		tc.logError("Failed to read response body", err, map[string]interface{}{
@@ -595,7 +595,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 		duration = time.Since(requestStart).String()
 	}
 
-	// Формируем ответ
+	// Format response
 	response := map[string]interface{}{
 		"status":  resp.StatusCode,
 		"headers": resp.Header,
@@ -630,7 +630,7 @@ func (tc *TunnelClient) handleHTTPRequest(requestID, data string) error {
 	delete(tc.requestTimes, requestID)
 	tc.requestMutex.Unlock()
 
-	// Отправляем ответ серверу
+	// Send response to server
 	return tc.writeJSON(Message{
 		Type:      "http_response",
 		TunnelID:  tc.tunnelID,
