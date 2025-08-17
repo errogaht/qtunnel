@@ -801,19 +801,29 @@ func getEnv(key, defaultValue string) string {
 	return defaultValue
 }
 
+var (
+	// Global client ID generated once per process
+	processClientID string
+	clientIDOnce    sync.Once
+)
+
 func generateClientID() string {
-	// Generate unique client ID for this process instance
-	// New process = new clientID = new tunnel domain
-	// Same process reconnecting = same clientID = same tunnel domain
-	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
-	}
+	clientIDOnce.Do(func() {
+		// Generate unique client ID for this process instance
+		// New process = new clientID = new tunnel domain  
+		// Same process reconnecting = same clientID = same tunnel domain
+		hostname, _ := os.Hostname()
+		if hostname == "" {
+			hostname = "unknown"
+		}
+		
+		processID := os.Getpid()
+		startTime := time.Now().UnixNano() // Process start time for uniqueness
+		randomBytes := make([]byte, 8)
+		cryptorand.Read(randomBytes)
+		
+		processClientID = fmt.Sprintf("%s-%d-%d-%x", hostname, processID, startTime, randomBytes)
+	})
 	
-	processID := os.Getpid()
-	timestamp := time.Now().UnixNano() // Use nanoseconds for better uniqueness
-	randomBytes := make([]byte, 8)     // Use more random bytes
-	cryptorand.Read(randomBytes)
-	
-	return fmt.Sprintf("%s-%d-%d-%x", hostname, processID, timestamp, randomBytes)
+	return processClientID
 }
