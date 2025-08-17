@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	cryptorand "crypto/rand"
+	"crypto/tls"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/net/http2"
 )
 
 var (
@@ -27,10 +29,12 @@ var (
 )
 
 type Config struct {
-	ServerURL    string
-	AuthToken    string
-	LocalPort    int
-	OutputFormat string
+	ServerURL     string
+	AuthToken     string
+	LocalPort     int
+	OutputFormat  string
+	Protocol      string // "websocket", "http2", "sse", "polling"
+	AutoFallback  bool   // Enable automatic protocol fallback
 }
 
 type Message struct {
@@ -72,9 +76,11 @@ type RequestLog struct {
 
 func main() {
 	var (
-		serverURL    = flag.String("server", "", "QTunnel server WebSocket URL (e.g., wss://qtunnel.example.com/ws)")
+		serverURL    = flag.String("server", "", "QTunnel server URL (e.g., wss://qtunnel.example.com/ws)")
 		authToken    = flag.String("token", "", "Authentication token for the server")
 		outputFormat = flag.String("output-format", "text", "Output format: text or stream.json")
+		protocol     = flag.String("protocol", "auto", "Connection protocol: websocket, http2, sse, polling, auto")
+		autoFallback = flag.Bool("auto-fallback", true, "Enable automatic protocol fallback on connection issues")
 		showVersion  = flag.Bool("version", false, "Show version information")
 		showHelp     = flag.Bool("help", false, "Show help information")
 	)
@@ -96,9 +102,11 @@ func main() {
 		fmt.Println("Example: qtunnel --server wss://qtunnel.example.com/ws --token your-token 8003")
 		fmt.Println("")
 		fmt.Println("Options:")
-		fmt.Println("  --server string         QTunnel server WebSocket URL")
+		fmt.Println("  --server string         QTunnel server URL")
 		fmt.Println("  --token string          Authentication token for the server")
 		fmt.Println("  --output-format string  Output format: text or stream.json (default: text)")
+		fmt.Println("  --protocol string       Connection protocol: websocket, http2, sse, polling, auto (default: auto)")
+		fmt.Println("  --auto-fallback        Enable automatic protocol fallback (default: true)")
 		fmt.Println("  -h, --help             Show this help message")
 		fmt.Println("  -v, --version          Show version information")
 		fmt.Println("")
@@ -143,6 +151,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate protocol
+	validProtocols := map[string]bool{
+		"auto": true, "websocket": true, "http2": true, "sse": true, "polling": true,
+	}
+	if !validProtocols[*protocol] {
+		fmt.Println("Error: Invalid protocol. Use 'websocket', 'http2', 'sse', 'polling', or 'auto'")
+		os.Exit(1)
+	}
+
 	// Validate required parameters
 	if finalServerURL == "wss://localhost:8080/ws" && finalAuthToken == "default-secret-token" {
 		fmt.Println("Error: You must specify server URL and auth token")
@@ -158,24 +175,39 @@ func main() {
 	}
 
 	config := &Config{
-		ServerURL:    finalServerURL,
-		AuthToken:    finalAuthToken,
-		LocalPort:    localPort,
-		OutputFormat: *outputFormat,
+		ServerURL:     finalServerURL,
+		AuthToken:     finalAuthToken,
+		LocalPort:     localPort,
+		OutputFormat:  *outputFormat,
+		Protocol:      *protocol,
+		AutoFallback:  *autoFallback,
+	}
+
+	// Create HTTP/2 client for alternative protocols
+	httpClient := &http.Client{
+		Transport: &http2.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: false,
+			},
+		},
+		Timeout: 30 * time.Second,
 	}
 
 	client := &TunnelClient{
 		config:       config,
+		httpClient:   httpClient,
 		clientID:     generateClientID(),
 		requestTimes: make(map[string]time.Time),
 	}
 
 	client.logInfo("Starting QTunnel client", map[string]interface{}{
-		"server_url":    config.ServerURL,
-		"local_port":    localPort,
-		"output_format": config.OutputFormat,
-		"client_id":     client.clientID,
-		"process_id":    os.Getpid(),
+		"server_url":     config.ServerURL,
+		"local_port":     localPort,
+		"output_format":  config.OutputFormat,
+		"protocol":       config.Protocol,
+		"auto_fallback":  config.AutoFallback,
+		"client_id":      client.clientID,
+		"process_id":     os.Getpid(),
 	})
 
 	err = client.Connect()
@@ -188,12 +220,14 @@ func main() {
 type TunnelClient struct {
 	config        *Config
 	conn          *websocket.Conn
+	httpClient    *http.Client     // For HTTP/2, SSE, polling
+	currentProto  string           // Currently active protocol
 	tunnelID      string
 	domain        string
-	clientID      string // Stable client ID for reconnections
+	clientID      string           // Stable client ID for reconnections
 	requestTimes  map[string]time.Time
 	requestMutex  sync.RWMutex
-	writeMutex    sync.Mutex // Prevents concurrent WebSocket writes
+	writeMutex    sync.Mutex       // Prevents concurrent writes
 }
 
 func (tc *TunnelClient) logInfo(message string, details interface{}) {
@@ -291,65 +325,113 @@ func (tc *TunnelClient) Connect() error {
 	baseDelay := 2 * time.Second // Reduced initial delay
 	maxDelay := 30 * time.Second // Cap maximum delay
 
+	// Determine protocols to try
+	protocols := tc.getProtocolsToTry()
+	
 	tc.logInfo("Starting connection process", map[string]interface{}{
 		"max_retries": maxRetries,
 		"base_delay": baseDelay.String(),
 		"max_delay": maxDelay.String(),
+		"protocols": protocols,
+		"auto_fallback": tc.config.AutoFallback,
 	})
 
 	for {
-		if retryCount > 0 {
-			// Calculate delay with exponential backoff and jitter
-			multiplier := 1 << uint(retryCount-1) // Exponential backoff: 1, 2, 4, 8, etc.
-			delay := time.Duration(int64(baseDelay) * int64(multiplier))
-			if delay > maxDelay {
-				delay = maxDelay
-			}
-			// Add jitter to prevent thundering herd
-			jitter := time.Duration(rand.Int63n(int64(delay / 4)))
-			finalDelay := delay + jitter
-			
-			tc.logInfo("Retrying connection", map[string]interface{}{
-				"attempt": retryCount + 1,
-				"max_attempts": maxRetries,
-				"delay": finalDelay.String(),
-				"client_id": tc.clientID,
-			})
-			time.Sleep(finalDelay)
-		}
-
-		err := tc.connectOnce()
-		if err != nil {
-			retryCount++
-			tc.logError("Connection attempt failed", err, map[string]interface{}{
-				"attempt": retryCount,
-				"max_attempts": maxRetries,
-				"error_type": fmt.Sprintf("%T", err),
-			})
-			
-			// Check if we should stop retrying
-			if retryCount >= maxRetries {
-				tc.logError("Max retry attempts exceeded", nil, map[string]interface{}{
-					"total_attempts": retryCount,
-					"last_error": err.Error(),
+		// Try each protocol in sequence
+		for _, protocol := range protocols {
+			if retryCount > 0 {
+				// Calculate delay with exponential backoff and jitter
+				multiplier := 1 << uint(retryCount-1) // Exponential backoff: 1, 2, 4, 8, etc.
+				delay := time.Duration(int64(baseDelay) * int64(multiplier))
+				if delay > maxDelay {
+					delay = maxDelay
+				}
+				// Add jitter to prevent thundering herd
+				jitter := time.Duration(rand.Int63n(int64(delay / 4)))
+				finalDelay := delay + jitter
+				
+				tc.logInfo("Retrying connection", map[string]interface{}{
+					"attempt": retryCount + 1,
+					"max_attempts": maxRetries,
+					"protocol": protocol,
+					"delay": finalDelay.String(),
+					"client_id": tc.clientID,
 				})
-				return fmt.Errorf("failed to establish stable connection after %d attempts: %v", retryCount, err)
+				time.Sleep(finalDelay)
 			}
-			continue
+
+			tc.currentProto = protocol
+			err := tc.connectWithProtocol(protocol)
+			if err != nil {
+				tc.logError("Connection attempt failed", err, map[string]interface{}{
+					"protocol": protocol,
+					"attempt": retryCount + 1,
+					"max_attempts": maxRetries,
+					"error_type": fmt.Sprintf("%T", err),
+				})
+				
+				// If auto-fallback enabled, try next protocol
+				if tc.config.AutoFallback && len(protocols) > 1 {
+					tc.logInfo("Trying next protocol", map[string]interface{}{
+						"failed_protocol": protocol,
+						"remaining_protocols": len(protocols) - 1,
+					})
+					continue // Try next protocol
+				}
+			} else {
+				// Success! Connection established
+				tc.logInfo("Protocol established successfully", map[string]interface{}{
+					"protocol": protocol,
+					"attempt": retryCount + 1,
+				})
+				break // Exit protocol loop on success
+			}
+		}
+		
+		retryCount++
+		// Check if we should stop retrying
+		if retryCount >= maxRetries {
+			tc.logError("Max retry attempts exceeded", nil, map[string]interface{}{
+				"total_attempts": retryCount,
+				"protocols_tried": protocols,
+			})
+			return fmt.Errorf("failed to establish stable connection after %d attempts with protocols %v", retryCount, protocols)
 		}
 
 		// Connection was successful but was lost - reset retry count for faster reconnection
 		if retryCount > 3 {
 			retryCount = 3 // Reset but keep some backoff
 		}
-		tc.logWarn("Connection lost, retrying", map[string]interface{}{
+		tc.logWarn("Connection lost, retrying with all protocols", map[string]interface{}{
 			"previous_attempts": retryCount,
 			"client_id": tc.clientID,
+			"protocols": protocols,
 		})
 	}
 }
 
-func (tc *TunnelClient) connectOnce() error {
+// connectWithProtocol attempts connection using specified protocol
+func (tc *TunnelClient) connectWithProtocol(protocol string) error {
+	tc.logInfo("Attempting connection", map[string]interface{}{
+		"protocol": protocol,
+		"client_id": tc.clientID,
+	})
+
+	switch protocol {
+	case "websocket":
+		return tc.connectWebSocket()
+	case "http2":
+		return tc.connectHTTP2()
+	case "sse":
+		return tc.connectSSE()
+	case "polling":
+		return tc.connectPolling()
+	default:
+		return fmt.Errorf("unsupported protocol: %s", protocol)
+	}
+}
+
+func (tc *TunnelClient) connectWebSocket() error {
 	tc.logInfo("Parsing server URL", map[string]interface{}{
 		"url": tc.config.ServerURL,
 		"client_id": tc.clientID,
@@ -826,4 +908,77 @@ func generateClientID() string {
 	})
 	
 	return processClientID
+}
+
+// connectHTTP2 establishes connection using HTTP/2 streaming
+func (tc *TunnelClient) connectHTTP2() error {
+	tc.logInfo("Starting HTTP/2 connection", map[string]interface{}{
+		"server_url": tc.config.ServerURL,
+		"client_id": tc.clientID,
+	})
+	
+	// Convert WebSocket URL to HTTP/2 URL
+	serverURL := tc.config.ServerURL
+	if strings.HasPrefix(serverURL, "ws://") {
+		serverURL = strings.Replace(serverURL, "ws://", "http://", 1)
+	} else if strings.HasPrefix(serverURL, "wss://") {
+		serverURL = strings.Replace(serverURL, "wss://", "https://", 1)
+	}
+	
+	// Replace /ws endpoint with /http2
+	serverURL = strings.Replace(serverURL, "/ws", "/http2", 1)
+	
+	tc.logInfo("HTTP/2 endpoint", map[string]interface{}{
+		"url": serverURL,
+	})
+	
+	// TODO: Implement HTTP/2 streaming connection
+	// For now, return an error to indicate it's not implemented
+	return fmt.Errorf("HTTP/2 protocol not yet implemented - falling back to next protocol")
+}
+
+// connectSSE establishes connection using Server-Sent Events
+func (tc *TunnelClient) connectSSE() error {
+	tc.logInfo("Starting SSE connection", map[string]interface{}{
+		"server_url": tc.config.ServerURL,
+		"client_id": tc.clientID,
+	})
+	
+	// TODO: Implement SSE connection
+	return fmt.Errorf("SSE protocol not yet implemented - falling back to next protocol")
+}
+
+// connectPolling establishes connection using HTTP polling
+func (tc *TunnelClient) connectPolling() error {
+	tc.logInfo("Starting HTTP polling connection", map[string]interface{}{
+		"server_url": tc.config.ServerURL,
+		"client_id": tc.clientID,
+	})
+	
+	// TODO: Implement HTTP polling connection
+	return fmt.Errorf("HTTP polling protocol not yet implemented - falling back to next protocol")
+}
+
+// getProtocolsToTry returns list of protocols to attempt based on config
+func (tc *TunnelClient) getProtocolsToTry() []string {
+	switch tc.config.Protocol {
+	case "websocket":
+		return []string{"websocket"}
+	case "http2":
+		return []string{"http2"}
+	case "sse":
+		return []string{"sse"}
+	case "polling":
+		return []string{"polling"}
+	case "auto":
+		if tc.config.AutoFallback {
+			// Try protocols in order of preference for VPN compatibility
+			return []string{"http2", "websocket", "sse", "polling"}
+		} else {
+			// Default to WebSocket for backward compatibility
+			return []string{"websocket"}
+		}
+	default:
+		return []string{"websocket"}
+	}
 }
