@@ -4,11 +4,15 @@ import (
 	"bufio"
 	"context"
 	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,6 +21,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"golang.org/x/crypto/ssh"
 )
 
 type Config struct {
@@ -24,6 +29,7 @@ type Config struct {
 	Domain         string `json:"domain"`
 	ListenAddr     string `json:"listen_addr"`
 	ProxyAddr      string `json:"proxy_addr"`
+	SSHAddr        string `json:"ssh_addr"`
 	TraefikDir     string `json:"traefik_dir"`
 	TLSCert        string `json:"tls_cert"`
 	TLSKey         string `json:"tls_key"`
@@ -40,10 +46,16 @@ type Tunnel struct {
 	WriteMutex     sync.Mutex      `json:"-"` // Prevents concurrent writes
 	
 	// HTTP/2 specific fields
-	Protocol       string          `json:"protocol"`                  // "websocket" or "http2"
+	Protocol       string          `json:"protocol"`                  // "websocket", "http2", or "ssh"
 	HTTP2Writer    io.Writer       `json:"-"`                        // HTTP/2 response writer
 	HTTP2Ctx       context.Context `json:"-"`                        // HTTP/2 context
 	HTTP2Cancel    context.CancelFunc `json:"-"`                     // HTTP/2 cancellation
+	
+	// SSH specific fields
+	SSHConn        ssh.Conn        `json:"-"`                        // SSH connection
+	SSHChannels    map[string]ssh.Channel `json:"-"`                 // SSH channels for requests
+	SSHSession     ssh.Channel     `json:"-"`                        // SSH session channel for output
+	SSHMutex       sync.RWMutex    `json:"-"`                        // SSH channels mutex
 }
 
 type TunnelManager struct {
@@ -97,11 +109,15 @@ func main() {
 	// HTTP proxy for incoming requests
 	go startProxyServer(manager)
 	
+	// SSH server for tunneling
+	go startSSHServer(manager)
+	
 	// Cleanup stale tunnels
 	go manager.cleanup()
 
 	log.Printf("QTunnel server starting on %s", config.ListenAddr)
 	log.Printf("Proxy server starting on %s", config.ProxyAddr)
+	log.Printf("SSH server starting on %s", config.SSHAddr)
 	log.Printf("Domain: %s", config.Domain)
 	
 	if config.TLSCert != "" && config.TLSKey != "" {
@@ -117,6 +133,7 @@ func loadConfig() *Config {
 		Domain:     getEnv("QTUNNEL_DOMAIN", "localhost"),
 		ListenAddr: getEnv("QTUNNEL_LISTEN", ":8080"),
 		ProxyAddr:  getEnv("QTUNNEL_PROXY", ":8081"),
+		SSHAddr:    getEnv("QTUNNEL_SSH", ":2222"),
 		TraefikDir: getEnv("QTUNNEL_TRAEFIK_DIR", "/etc/traefik/dynamic"),
 		TLSCert:    getEnv("QTUNNEL_TLS_CERT", ""),
 		TLSKey:     getEnv("QTUNNEL_TLS_KEY", ""),
@@ -578,6 +595,23 @@ func (tm *TunnelManager) writeToTunnel(tunnel *Tunnel, msg Message) error {
 		}
 		
 		return nil
+	case "ssh":
+		if tunnel.SSHSession == nil {
+			// SSH tunnel might not have session channel
+			return nil
+		}
+		
+		// For SSH, send domain info to session channel
+		if msg.Type == "tunnel_created" {
+			_, err := fmt.Fprintf(tunnel.SSHSession, "DOMAIN:https://%s\n", msg.Data)
+			if err != nil {
+				return fmt.Errorf("failed to write SSH message for tunnel %s: %v", tunnel.ID, err)
+			}
+			_, err = fmt.Fprintf(tunnel.SSHSession, "STATUS:CONNECTED\n")
+			return err
+		}
+		
+		return nil
 	default:
 		return fmt.Errorf("unknown protocol %s for tunnel %s", tunnel.Protocol, tunnel.ID)
 	}
@@ -939,4 +973,317 @@ func getClientIP(r *http.Request) string {
 		return r.RemoteAddr[:idx]
 	}
 	return r.RemoteAddr
+}
+
+// SSH Server Functions
+
+func startSSHServer(tm *TunnelManager) {
+	// Generate or load SSH host key
+	hostKey, err := generateOrLoadHostKey("qtunnel_ssh_host_key")
+	if err != nil {
+		log.Fatalf("Failed to load SSH host key: %v", err)
+	}
+
+	// SSH server configuration
+	sshConfig := &ssh.ServerConfig{
+		PasswordCallback: func(conn ssh.ConnMetadata, password []byte) (*ssh.Permissions, error) {
+			return tm.authenticateSSHUser(conn.User(), string(password))
+		},
+		ServerVersion: "SSH-2.0-qtunnel-server",
+	}
+	sshConfig.AddHostKey(hostKey)
+
+	// Listen on SSH port
+	listener, err := net.Listen("tcp", tm.config.SSHAddr)
+	if err != nil {
+		log.Fatalf("Failed to listen on SSH port %s: %v", tm.config.SSHAddr, err)
+	}
+	defer listener.Close()
+
+	log.Printf("[SSH] SSH server listening on %s", tm.config.SSHAddr)
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("[SSH] Failed to accept SSH connection: %v", err)
+			continue
+		}
+
+		go tm.handleSSHConnection(conn, sshConfig)
+	}
+}
+
+func generateOrLoadHostKey(keyFile string) (ssh.Signer, error) {
+	// Check if key file exists
+	if keyData, err := os.ReadFile(keyFile); err == nil {
+		// Load existing key
+		return ssh.ParsePrivateKey(keyData)
+	}
+
+	// Generate new RSA key
+	log.Printf("[SSH] Generating new SSH host key: %s", keyFile)
+	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate private key: %v", err)
+	}
+
+	// Encode to PEM format
+	keyPEM := &pem.Block{
+		Type:  "RSA PRIVATE KEY",
+		Bytes: x509.MarshalPKCS1PrivateKey(privateKey),
+	}
+	keyData := pem.EncodeToMemory(keyPEM)
+
+	// Save to file
+	if err := os.WriteFile(keyFile, keyData, 0600); err != nil {
+		return nil, fmt.Errorf("failed to save private key: %v", err)
+	}
+
+	return ssh.NewSignerFromKey(privateKey)
+}
+
+func (tm *TunnelManager) authenticateSSHUser(username, password string) (*ssh.Permissions, error) {
+	// Use existing token authentication
+	if password == tm.config.AuthToken {
+		log.Printf("[SSH] User authenticated with token: %s", username)
+		return &ssh.Permissions{}, nil
+	}
+
+	// Also allow username as token (for convenience)
+	if username == tm.config.AuthToken {
+		log.Printf("[SSH] User authenticated with username as token: %s", username)
+		return &ssh.Permissions{}, nil
+	}
+
+	log.Printf("[SSH] Authentication failed for user %s", username)
+	return nil, fmt.Errorf("invalid authentication")
+}
+
+func (tm *TunnelManager) handleSSHConnection(conn net.Conn, sshConfig *ssh.ServerConfig) {
+	defer conn.Close()
+
+	clientAddr := conn.RemoteAddr().String()
+	log.Printf("[SSH] New SSH connection from %s", clientAddr)
+
+	// SSH handshake
+	sshConn, chans, reqs, err := ssh.NewServerConn(conn, sshConfig)
+	if err != nil {
+		log.Printf("[SSH] SSH handshake failed for %s: %v", clientAddr, err)
+		return
+	}
+	defer sshConn.Close()
+
+	log.Printf("[SSH] SSH user %s connected from %s", sshConn.User(), clientAddr)
+
+	// Handle SSH requests (port forwarding)
+	go tm.handleSSHRequests(reqs, sshConn)
+
+	// Handle SSH channels (reject shell sessions)
+	go tm.handleSSHChannels(chans, sshConn)
+
+	// Wait for connection close
+	err = sshConn.Wait()
+	if err != nil {
+		log.Printf("[SSH] SSH connection closed with error: %v", err)
+	} else {
+		log.Printf("[SSH] SSH connection closed cleanly for %s", clientAddr)
+	}
+}
+
+func (tm *TunnelManager) handleSSHRequests(reqs <-chan *ssh.Request, sshConn ssh.Conn) {
+	for req := range reqs {
+		log.Printf("[SSH] SSH request from %s: type=%s", sshConn.RemoteAddr(), req.Type)
+		
+		switch req.Type {
+		case "tcpip-forward":
+			tm.handleTCPIPForward(req, sshConn)
+		case "cancel-tcpip-forward":
+			tm.handleCancelTCPIPForward(req, sshConn)
+		case "keepalive@openssh.com":
+			req.Reply(true, nil)
+		default:
+			log.Printf("[SSH] Rejecting unknown request type: %s", req.Type)
+			req.Reply(false, nil)
+		}
+	}
+}
+
+func (tm *TunnelManager) handleSSHChannels(chans <-chan ssh.NewChannel, sshConn ssh.Conn) {
+	for newChannel := range chans {
+		channelType := newChannel.ChannelType()
+		log.Printf("[SSH] SSH channel request from %s: type=%s", sshConn.RemoteAddr(), channelType)
+		
+		switch channelType {
+		case "session":
+			// Accept session but don't provide shell - just for status output
+			channel, requests, err := newChannel.Accept()
+			if err != nil {
+				log.Printf("[SSH] Failed to accept session channel: %v", err)
+				continue
+			}
+
+			// Handle session requests
+			go tm.handleSSHSession(channel, requests, sshConn)
+			
+		case "direct-tcpip":
+			// Handle direct TCP forwarding through SSH
+			tm.handleDirectTCPIP(newChannel, sshConn)
+			
+		default:
+			log.Printf("[SSH] Rejecting unknown channel type: %s", channelType)
+			newChannel.Reject(ssh.UnknownChannelType, "unknown channel type")
+		}
+	}
+}
+
+func (tm *TunnelManager) handleTCPIPForward(req *ssh.Request, sshConn ssh.Conn) {
+	// Parse port forward request
+	var portForward struct {
+		BindAddr string
+		BindPort uint32
+	}
+	
+	if err := ssh.Unmarshal(req.Payload, &portForward); err != nil {
+		log.Printf("[SSH] Failed to parse tcpip-forward request: %v", err)
+		req.Reply(false, nil)
+		return
+	}
+	
+	log.Printf("[SSH] Port forward request: %s:%d", portForward.BindAddr, portForward.BindPort)
+	
+	// Generate random tunnel domain (same as WebSocket)
+	tunnelID := generateRandomID()
+	domain := fmt.Sprintf("%s-tun.%s", tunnelID, tm.config.Domain)
+	
+	// Create tunnel
+	tunnel := &Tunnel{
+		ID:          tunnelID,
+		Domain:      domain,
+		Protocol:    "ssh",
+		SSHConn:     sshConn,
+		SSHChannels: make(map[string]ssh.Channel),
+		Port:        int(portForward.BindPort),
+		LastSeen:    time.Now(),
+		Connected:   true,
+	}
+	
+	// Store tunnel
+	tm.mutex.Lock()
+	tm.tunnels[tunnelID] = tunnel
+	tm.mutex.Unlock()
+	
+	log.Printf("[SSH] Created SSH tunnel %s: %s", tunnelID, domain)
+	
+	// Create Traefik config (reuse existing logic)
+	tm.createTraefikConfig(tunnel)
+	
+	// Reply to SSH client with success
+	req.Reply(true, ssh.Marshal(struct{ Port uint32 }{portForward.BindPort}))
+	
+	// Send domain info through writeToTunnel if session exists
+	tm.writeToTunnel(tunnel, Message{
+		Type:     "tunnel_created", 
+		TunnelID: tunnelID,
+		Data:     domain,
+	})
+	
+	log.Printf("[SSH] SSH tunnel %s ready: https://%s", tunnelID, domain)
+}
+
+func (tm *TunnelManager) handleCancelTCPIPForward(req *ssh.Request, sshConn ssh.Conn) {
+	// Parse cancel request
+	var cancelForward struct {
+		BindAddr string
+		BindPort uint32
+	}
+	
+	if err := ssh.Unmarshal(req.Payload, &cancelForward); err != nil {
+		req.Reply(false, nil)
+		return
+	}
+	
+	log.Printf("[SSH] Cancel port forward: %s:%d", cancelForward.BindAddr, cancelForward.BindPort)
+	
+	// Find and remove tunnel
+	tm.mutex.Lock()
+	for id, tunnel := range tm.tunnels {
+		if tunnel.Protocol == "ssh" && tunnel.SSHConn == sshConn && tunnel.Port == int(cancelForward.BindPort) {
+			delete(tm.tunnels, id)
+			tm.removeTraefikConfig(tunnel)
+			log.Printf("[SSH] Removed tunnel %s", id)
+			break
+		}
+	}
+	tm.mutex.Unlock()
+	
+	req.Reply(true, nil)
+}
+
+func (tm *TunnelManager) handleSSHSession(channel ssh.Channel, requests <-chan *ssh.Request, sshConn ssh.Conn) {
+	defer channel.Close()
+	
+	// Send welcome message
+	fmt.Fprintf(channel, "QTunnel SSH Server\n")
+	fmt.Fprintf(channel, "Connected from: %s\n", sshConn.RemoteAddr())
+	fmt.Fprintf(channel, "Keep this session open to maintain tunnels.\n")
+	fmt.Fprintf(channel, "Press Ctrl+C to close.\n\n")
+	
+	// Handle session requests
+	for req := range requests {
+		switch req.Type {
+		case "pty-req", "shell":
+			// Accept but don't actually provide shell
+			req.Reply(true, nil)
+		case "env":
+			req.Reply(true, nil)
+		case "exec":
+			req.Reply(false, nil)
+		default:
+			req.Reply(false, nil)
+		}
+	}
+}
+
+func (tm *TunnelManager) handleDirectTCPIP(newChannel ssh.NewChannel, sshConn ssh.Conn) {
+	// Parse direct TCP request
+	var directTCPIP struct {
+		Host       string
+		Port       uint32
+		OriginHost string
+		OriginPort uint32
+	}
+	
+	if err := ssh.Unmarshal(newChannel.ExtraData(), &directTCPIP); err != nil {
+		newChannel.Reject(ssh.ConnectionFailed, "failed to parse direct-tcpip request")
+		return
+	}
+	
+	// Accept the channel
+	channel, requests, err := newChannel.Accept()
+	if err != nil {
+		log.Printf("[SSH] Failed to accept direct-tcpip channel: %v", err)
+		return
+	}
+	defer channel.Close()
+	
+	// Discard requests
+	go ssh.DiscardRequests(requests)
+	
+	// Connect to target
+	targetAddr := fmt.Sprintf("%s:%d", directTCPIP.Host, directTCPIP.Port)
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Printf("[SSH] Failed to connect to target %s: %v", targetAddr, err)
+		return
+	}
+	defer targetConn.Close()
+	
+	log.Printf("[SSH] Direct TCP forwarding: %s -> %s", sshConn.RemoteAddr(), targetAddr)
+	
+	// Bidirectional copy
+	go func() {
+		io.Copy(channel, targetConn)
+		channel.CloseWrite()
+	}()
+	io.Copy(targetConn, channel)
 }
